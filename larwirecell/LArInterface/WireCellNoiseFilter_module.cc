@@ -21,8 +21,8 @@
 #include "WireCellUtil/Units.h"
 #include "WireCellUtil/NamedFactory.h"
 #include "WireCellIface/IDFT.h"
-#include "WireCellIface/SimpleFrame.h"
-#include "WireCellIface/SimpleTrace.h"
+#include "WireCellAux/SimpleFrame.h"
+#include "WireCellAux/SimpleTrace.h"
 #include "WireCellAux/DftTools.h"
 #include "WireCellSigProc/Microboone.h"
 #include "WireCellSigProc/OmnibusNoiseFilter.h"
@@ -32,6 +32,8 @@
 #include <string>
 
 using namespace WireCell;
+using WireCell::Aux::SimpleTrace;
+using WireCell::Aux::SimpleFrame;
 
 namespace noisefilteralg {
 
@@ -411,12 +413,12 @@ namespace noisefilteralg {
       });
 
       unsigned int chan = inputWaveforms.at(ich).Channel();
-      WireCell::SimpleTrace* st = new WireCell::SimpleTrace(chan, 0.0, charges);
+      SimpleTrace* st = new SimpleTrace(chan, 0.0, charges);
       traces.push_back(WireCell::ITrace::pointer(st));
     }
 
     //Load traces into frame
-    WireCell::SimpleFrame* sf = new WireCell::SimpleFrame(0, 0, traces);
+    SimpleFrame* sf = new SimpleFrame(0, 0, traces);
     WireCell::IFrame::pointer frame = WireCell::IFrame::pointer(sf);
     WireCell::IFrame::pointer quiet = NULL;
 

@@ -16,12 +16,13 @@
 #include "WireCellUtil/Units.h"
 #include "WireCellUtil/String.h"
 #include "WireCellUtil/NamedFactory.h"
-#include "WireCellIface/SimpleDepo.h"
+#include "WireCellAux/SimpleDepo.h"
 #include "WireCellIface/IRecombinationModel.h"
 
 WIRECELL_FACTORY(wclsSimDepoSource, wcls::SimDepoSource, wcls::IArtEventVisitor,
                  WireCell::IDepoSource, WireCell::IConfigurable)
 
+using WireCell::Aux::SimpleDepo;
 
 namespace units = WireCell::units;
 
@@ -209,7 +210,7 @@ void SimDepoSource::visit(art::Event & event)
 
         if (assn_sedv.size() == 0) {
             WireCell::IDepo::pointer depo
-                = std::make_shared<WireCell::SimpleDepo>(wt, wpt, wq, nullptr, 0.0, 0.0, wid, pdg, we);
+                = std::make_shared<SimpleDepo>(wt, wpt, wq, nullptr, 0.0, 0.0, wid, pdg, we);
             m_depos.push_back(depo);
             // std::cerr << ind << ": t=" << wt/units::us << "us,"
             //           << " r=" << wpt/units::cm << "cm, "
@@ -227,10 +228,10 @@ void SimDepoSource::visit(art::Event & event)
             double we1 = sed1.Energy()*units::MeV;
 
             WireCell::IDepo::pointer assn_depo
-            = std::make_shared<WireCell::SimpleDepo>(wt1, wpt1, wq1, nullptr, 0.0, 0.0, wid1, pdg1, we1);
+            = std::make_shared<SimpleDepo>(wt1, wpt1, wq1, nullptr, 0.0, 0.0, wid1, pdg1, we1);
 
             WireCell::IDepo::pointer depo
-                = std::make_shared<WireCell::SimpleDepo>(wt, wpt, wq, assn_depo, 0.0, 0.0, wid, pdg, we);
+                = std::make_shared<SimpleDepo>(wt, wpt, wq, assn_depo, 0.0, 0.0, wid, pdg, we);
             m_depos.push_back(depo);
             // std::cerr << ind << ": t1=" << wt1/units::us << "us,"
             //           << " r1=" << wpt1/units::cm << "cm, "
@@ -243,7 +244,7 @@ void SimDepoSource::visit(art::Event & event)
     if (ndepos == 0) {
 	    WireCell::Point wpt(0, 0, 0);
 	    WireCell::IDepo::pointer depo
-		    = std::make_shared<WireCell::SimpleDepo>(0, wpt, 0, nullptr, 0.0, 0.0);
+		    = std::make_shared<SimpleDepo>(0, wpt, 0, nullptr, 0.0, 0.0);
 	    m_depos.push_back(depo);
     }
 
