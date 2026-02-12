@@ -216,6 +216,16 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     return cluster1->get_length() > cluster2->get_length();
   });
 
+  double total_charge_blob = 0.0;
+  double total_charge_point = 0.0;
+  double total_charge_blob_all = 0.0;
+  for (auto cluster : clusters) {
+    std::vector<Blob*> blobs = cluster->children();
+    for (auto blob : blobs) {
+        total_charge_blob_all += blob->charge();
+    }
+  }
+
   // add default cluster_t0 to all clusters
   std::for_each(
     clusters.begin(), clusters.end(), [this](Cluster* cluster) { cluster->set_cluster_t0(-1e12); });
@@ -259,7 +269,7 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
         flash_opdet_mask[idet] = 0;
     }
 
-    log->trace("flash time {} flash PE {} flash_x_offset {}",
+    log->debug("flash time {} flash PE {} flash_x_offset {}",
                int(flash_time) / 100.,
                int(flash->get_total_PE() * 100) / 100.,
                int(flash_x_offset * 100) / 100.);
@@ -285,10 +295,12 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
       // log->debug("flash {} and cluster {} with {} children", flash->get_flash_id(), icluster, cluster->nchildren());
       std::vector<Blob*> blobs = cluster->children();
       for (auto blob : blobs) {
+        total_charge_blob += blob->charge();
         auto q = blob->charge() / blob->npoints();
         std::vector<geo_point_t> points = blob->points("3d", {"x", "y", "z"});
 
         for (int i = 0; i != blob->npoints(); i++) {
+          total_charge_point += q;
           auto x = points.at(i).x() + flash_x_offset;
           auto y = points.at(i).y();
           auto z = points.at(i).z();
@@ -352,7 +364,7 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
         continue;
       }
 
-      log->trace("initial eval: flash {} and cluster {}, meas PE {}, pred PE {}, npts {}, ks_dis "
+      log->debug("initial eval: flash {} and cluster {}, meas PE {}, pred PE {}, npts {}, ks_dis "
                  "{}, chi2/ndf {}, ndf {}",
                  flash->get_flash_id(),
                  global_cluster_idx_map[cluster],
@@ -589,7 +601,7 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
         auto bundle = bundles.at(k);
 
         if (solution(n) > 0.05 || m_beamonly)
-          log->trace("first match: flash {} and cluster {}, solution={}",
+          log->debug("first match: flash {} and cluster {}, solution={}",
                      flash->get_flash_id(),
                      global_cluster_idx_map[bundle->get_main_cluster()],
                      solution(n));
@@ -603,7 +615,7 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     for (auto it = flash_bundles_map.begin(); it != flash_bundles_map.end(); ++it) {
       auto flash = it->first;
       if (solution(nbundle + m) != 0)
-        log->trace(
+        log->debug(
           "flash-only: flash {}, solution={}", flash->get_flash_id(), solution(nbundle + m));
       m++;
     }
@@ -732,7 +744,7 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
         bundle->set_strength(solution(n));
 
         if (solution(n) > 0.05 || m_beamonly) {
-          log->trace("second match: flash {} and cluster {}, time {}, meas PE {}, pred PE {}, "
+          log->debug("second match: flash {} and cluster {}, time {}, meas PE {}, pred PE {}, "
                      "solution {}, ks_dis {}, chi2/ndf {}, consistent {}",
                      flash->get_flash_id(),
                      global_cluster_idx_map[bundle->get_main_cluster()],
@@ -817,7 +829,7 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     {
       for (auto [flash, bundles] : results_flash_bundles_map) {
         for (const auto& bundle : bundles) {
-          log->trace("results_flash_bundles_map: flash id {} time {} and cluster gidx {}, "
+          log->debug("results_flash_bundles_map: flash id {} time {} and cluster gidx {}, "
                      "total_pred_light {}, strength {}, ks_dis {}, chi2/ndf {}",
                      flash->get_flash_id(),
                      flash->get_time(),
@@ -876,6 +888,17 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     outtens.insert(outtens.end(), tens_dead.begin(), tens_dead.end());
 
     out = Aux::TensorDM::as_tensorset(outtens, charge_ident);
+  }
+
+  if (flashes.size() > 0) {
+    log->debug("total_charge_blob {} total_charge_point {} total_charge_blob_all {}",
+               total_charge_blob / flashes.size(),
+               total_charge_point / flashes.size(),
+               total_charge_blob_all);
+  }
+  else {
+    log->debug("total_charge_blob {} total_charge_point {} total_charge_blob_all {}",
+               0, 0, total_charge_blob_all);
   }
 
   // dumy output

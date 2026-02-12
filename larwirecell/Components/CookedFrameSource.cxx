@@ -133,12 +133,15 @@ void CookedFrameSource::visit(art::Event& event)
   // fixme: want to avoid depending on DetectorPropertiesService for now.
   const double tick = m_tick;
   const double time = tdiff(event.getRun().beginTime(), event.time());
+  m_totalcharge.clear();
 
   ITrace::vector* itraces = new ITrace::vector; // will become shared_ptr.
   IFrame::trace_list_t indices;
-  std::map<std::string, IFrame::trace_list_t> tag2indices;
+  std::map<int, IFrame::trace_list_t> tagindex2indices;
 
-  for (auto const& recobwire_tag : m_recobwire_tags) {
+  for (size_t tag_idx = 0; tag_idx < m_recobwire_tags.size(); ++tag_idx) {
+    auto const& recobwire_tag = m_recobwire_tags[tag_idx];
+    auto const& trace_tag = m_trace_tags[tag_idx];
     art::Handle<std::vector<recob::Wire>> rwvh;
     art::InputTag recobwire_tag_art(recobwire_tag);
     bool okay = event.getByLabel(recobwire_tag_art, rwvh);
@@ -152,10 +155,17 @@ void CookedFrameSource::visit(art::Event& event)
     for (size_t ind = 0; ind < nchannels; ++ind) {
       auto const& rw = rwv.at(ind);
       SimpleTrace* trace = make_trace(rw, m_nticks, m_frame_scale);
+      if (!trace_tag.empty()) {
+        float total = 0.0f;
+        for (auto val : trace->charge()) {
+          total += val;
+        }
+        m_totalcharge[trace_tag] += total;
+      }
       const size_t trace_index = itraces->size();
 
       indices.push_back(trace_index);
-      tag2indices[recobwire_tag].push_back(trace_index);
+      tagindex2indices[tag_idx].push_back(trace_index);
       itraces->push_back(ITrace::pointer(trace));
     }
   }
@@ -215,11 +225,15 @@ void CookedFrameSource::visit(art::Event& event)
       for (auto val : *tag2summaryh[summary_tag]) {
         summary.push_back(val * m_summary_scale);
       }
-      sframe->tag_traces(trace_tag, tag2indices[recobwire_tag], summary);
+      sframe->tag_traces(trace_tag, tagindex2indices[ind], summary);
     }
     else {
-      sframe->tag_traces(trace_tag, tag2indices[recobwire_tag]);
+      sframe->tag_traces(trace_tag, tagindex2indices[ind]);
     }
+  }
+
+  for (auto const& [tag, total] : m_totalcharge) {
+    l->info("CookedFrameSource total charge [{}]: {}", tag, total);
   }
 
   m_frames.push_back(WireCell::IFrame::pointer(sframe));

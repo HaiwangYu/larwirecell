@@ -16,6 +16,7 @@
 #include "canvas/Utilities/InputTag.h"
 
 #include <deque>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,7 @@ namespace wcls {
     std::vector<std::string> m_summary_tags;
     std::vector<std::string> m_input_mask_tags;
     std::vector<std::string> m_output_mask_tags;
+    std::map<std::string, float> m_totalcharge;
     WireCell::Log::logptr_t l;
   };
 
