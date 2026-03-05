@@ -56,9 +56,11 @@ void WireCell::QLMatch::QLMatching::configure(const WireCell::Configuration& cfg
   m_data = get(cfg, "data", m_data);
   m_beamonly = get(cfg, "beamonly", m_beamonly);
 
-  Configuration jch_mask = cfg["ch_mask"];
-  for (const auto& jch : jch_mask) {
-    m_ch_mask.push_back(jch.asInt());
+  if (cfg.isMember("ch_mask") && cfg["ch_mask"].isArray()) {
+    m_ch_mask.clear();
+    for (const auto& jch : cfg["ch_mask"]) {
+      m_ch_mask.push_back(jch.asInt());
+    }
   }
 
   m_flash_minPE = get(cfg, "flash_minPE", m_flash_minPE);
@@ -150,10 +152,8 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
                   0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                   0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0};
 
-  if (m_data) {
-    for (size_t idet = 0; idet < m_ch_mask.size(); idet++) {
-      opdet_mask[m_ch_mask[idet]] = 0;
-    }
+  for (size_t idet = 0; idet < m_ch_mask.size(); idet++) {
+    opdet_mask[m_ch_mask[idet]] = 0;
   }
 
   // ! end things to move to config block
