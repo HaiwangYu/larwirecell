@@ -23,7 +23,9 @@ cet_build_plugin(SBNDOpDetDumper art::EDAnalyzer
     larcore::Geometry_Geometry_service
     larcorealg::Geometry
     larcore::headers
+    lardata::DetectorInfoServices_LArPropertiesServiceStandard_service
     larsim::IonizationScintillation
+    larsim::PhotonPropagation
     art_root_io::TFileService_service
 )
 

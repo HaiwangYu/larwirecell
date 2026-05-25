@@ -12,10 +12,12 @@
 #       | sed 's/^OPDET://' > sbnd_opdets.csv
 
 #include "simulationservices_sbnd.fcl"
+#include "larproperties.fcl"
 
 services: {
   @table::sbnd_geometry_services
   AuxDetGeometry: @local::sbnd_auxdetgeo
+  LArPropertiesService: @local::standard_properties
 }
 
 source: { module_type: EmptyEvent  maxEvents: 1 }

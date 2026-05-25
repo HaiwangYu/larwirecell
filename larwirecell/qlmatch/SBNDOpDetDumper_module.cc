@@ -24,7 +24,9 @@
 #include "larcorealg/Geometry/CryostatGeo.h"
 #include "larcorealg/Geometry/OpDetGeo.h"
 #include "larcorealg/Geometry/TPCGeo.h"
+#include "lardata/DetectorInfoServices/LArPropertiesService.h"
 #include "larsim/IonizationScintillation/ISTPC.h"
+#include "larsim/PhotonPropagation/PhotonPropagationUtils.h"
 
 #include <iostream>
 
@@ -45,6 +47,19 @@ namespace sbnd {
       const auto& av = activeVolumes.front();
       const double cathodeX = geom.TPC().GetCathodeCenter().X();
       const double driftDistance = geom.TPC().DriftDistance();
+      // VUV absorption length: SemiAnalyticalModel::VUVAbsorptionLength()
+      // pulls AbsLengthSpectrum from LArPropertiesService and interpolates at
+      // 9.7 eV (Ar VUV peak). Reproduce that here so the WCT-side JSON gets
+      // the exact value larsim would use.
+      {
+        auto const& props = *(lar::providerFrom<detinfo::LArPropertiesService>());
+        auto spec = props.AbsLengthSpectrum();
+        std::vector<double> ev, ab;
+        ev.reserve(spec.size()); ab.reserve(spec.size());
+        for (auto const& kv : spec) { ev.push_back(kv.first); ab.push_back(kv.second); }
+        const double vuv_abs = phot::interpolate(ev, ab, 9.7, false);
+        std::cout << "GEOM:vuv_absorption_length," << vuv_abs << "\n";
+      }
       std::cout << "GEOM:active_center_y," << av.CenterY() << "\n";
       std::cout << "GEOM:active_center_z," << av.CenterZ() << "\n";
       std::cout << "GEOM:active_size_y,"   << av.SizeY()   << "\n";
