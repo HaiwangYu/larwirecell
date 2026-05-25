@@ -71,6 +71,7 @@ void WireCell::QLMatch::QLMatching::configure(const WireCell::Configuration& cfg
   }
 
   m_QtoL = get(cfg, "QtoL", m_QtoL);
+  m_strength_cutoff = get(cfg, "strength_cutoff", m_strength_cutoff);
 
   if (cfg["VUVEfficiency"].isArray()) {
     m_VUVEfficiency.clear();
@@ -104,6 +105,7 @@ WireCell::Configuration WireCell::QLMatch::QLMatching::default_configuration() c
   cfg["beam_mintime"] = m_beam_mintime;
   cfg["beam_maxtime"] = m_beam_maxtime;
   cfg["QtoL"] = m_QtoL;
+  cfg["strength_cutoff"] = m_strength_cutoff;
 
   return cfg;
 }
@@ -414,6 +416,44 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     flash_cluster_bundles_map[std::make_pair(flash, cluster)] = bundle;
   } // end pre-selected bundle loop
 
+  // Deterministic iteration order over flashes/clusters/bundles. Without
+  // these, the LASSO matrix column / row order depends on heap allocator
+  // ordering of Opflash* / Cluster* / shared_ptr addresses --- two runs
+  // with identical inputs then permute matrix columns and produce slightly
+  // different solution() vectors, enough to flip bundles across the
+  // m_strength_cutoff threshold.
+  //
+  // Outer order: flash_id (stable, from the input tensor row index).
+  // Cluster order: global index from the length-sorted 'clusters' vector.
+  // Inner per-flash bundles: cluster_index_id (same global index).
+  auto sort_inner_by_cluster_idx = [](FlashBundlesMap& m) {
+    for (auto& kv : m) {
+      std::sort(kv.second.begin(), kv.second.end(),
+                [](const TimingTPCBundle::pointer& a,
+                   const TimingTPCBundle::pointer& b) {
+                  return a->get_cluster_index_id() < b->get_cluster_index_id();
+                });
+    }
+  };
+  auto flash_iter_order = [](const FlashBundlesMap& m) {
+    std::vector<Opflash*> v;
+    v.reserve(m.size());
+    for (auto& kv : m) v.push_back(kv.first);
+    std::sort(v.begin(), v.end(),
+              [](Opflash* a, Opflash* b) { return a->get_flash_id() < b->get_flash_id(); });
+    return v;
+  };
+  auto cluster_iter_order = [&global_cluster_idx_map](const ClusterBundlesMap& m) {
+    std::vector<Cluster*> v;
+    v.reserve(m.size());
+    for (auto& kv : m) v.push_back(kv.first);
+    std::sort(v.begin(), v.end(), [&](Cluster* a, Cluster* b) {
+      return global_cluster_idx_map.at(a) < global_cluster_idx_map.at(b);
+    });
+    return v;
+  };
+  sort_inner_by_cluster_idx(flash_bundles_map);
+
   TimingTPCBundleSelection to_be_removed;
   for (auto good_bundle : consistent_bundles) {
     auto flash = good_bundle->get_flash();
@@ -460,6 +500,9 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     uint nflash = flash_bundles_map.size();
     uint ncluster = cluster_bundles_map.size();
 
+    auto flashes_ordered  = flash_iter_order(flash_bundles_map);
+    auto clusters_ordered = cluster_iter_order(cluster_bundles_map);
+
     // create map between flash object and flash vector/matrix index
     std::map<Opflash*, int> flash_idx_map;
     // create map between cluster object and cluster vector/matrix index
@@ -467,22 +510,17 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
 
     int cluster_idx = 0;
     int flash_idx = 0;
-    for (auto it = cluster_bundles_map.begin(); it != cluster_bundles_map.end(); ++it) {
-      auto cluster = it->first;
-      auto index = cluster_idx;
-      cluster_idx_map[cluster] = index;
+    for (auto* cluster : clusters_ordered) {
+      cluster_idx_map[cluster] = cluster_idx;
       cluster_idx++;
     }
-    for (auto it = flash_bundles_map.begin(); it != flash_bundles_map.end(); ++it) {
-      auto flash = it->first;
-      auto index = flash_idx;
-      flash_idx_map[flash] = index;
+    for (auto* flash : flashes_ordered) {
+      flash_idx_map[flash] = flash_idx;
       flash_idx++;
     }
 
-    for (auto it = flash_bundles_map.begin(); it != flash_bundles_map.end(); ++it) {
-      auto flash = it->first;
-      auto bundles = it->second;
+    for (auto* flash : flashes_ordered) {
+      auto& bundles = flash_bundles_map[flash];
       for (size_t i = 0; i < bundles.size(); i++) {
         auto bundle = bundles.at(i);
         if (bundle->get_consistent_flag()) {
@@ -516,9 +554,8 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
 
     size_t i = 0;  // flash index counter
     size_t ik = 0; // weights index counter
-    for (auto it = flash_bundles_map.begin(); it != flash_bundles_map.end(); ++it) {
-      auto flash = it->first;
-      auto bundles = it->second;
+    for (auto* flash : flashes_ordered) {
+      auto& bundles = flash_bundles_map[flash];
 
       for (uint j = 0; j < nopdet; j++) {
         auto opdet_idx = opdet_idx_v.at(j);
@@ -594,13 +631,12 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     Ress::vector_t solution = Ress::solve(X, y, params, initial, weights);
 
     int n = 0;
-    for (auto it = flash_bundles_map.begin(); it != flash_bundles_map.end(); ++it) {
-      auto flash = it->first;
-      auto bundles = it->second;
+    for (auto* flash : flashes_ordered) {
+      auto& bundles = flash_bundles_map[flash];
       for (size_t k = 0; k < bundles.size(); k++) {
         auto bundle = bundles.at(k);
 
-        if (solution(n) > 0.05 || m_beamonly)
+        if (solution(n) > m_strength_cutoff || m_beamonly)
           log->debug("first match: flash {} and cluster {}, solution={}",
                      flash->get_flash_id(),
                      global_cluster_idx_map[bundle->get_main_cluster()],
@@ -612,8 +648,7 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
       }
     }
     int m = 0;
-    for (auto it = flash_bundles_map.begin(); it != flash_bundles_map.end(); ++it) {
-      auto flash = it->first;
+    for (auto* flash : flashes_ordered) {
       if (solution(nbundle + m) != 0)
         log->debug(
           "flash-only: flash {}, solution={}", flash->get_flash_id(), solution(nbundle + m));
@@ -630,6 +665,10 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     uint nflash = flash_bundles_map.size();
     uint ncluster = cluster_bundles_map.size();
 
+    // Rebuild ordered iteration (round 1 may have removed bundles/flashes/clusters).
+    auto flashes_ordered  = flash_iter_order(flash_bundles_map);
+    auto clusters_ordered = cluster_iter_order(cluster_bundles_map);
+
     // create map between cluster object and cluster vector/matrix index
     // create map between flash object and flash vector/matrix index
     std::map<Cluster*, int> cluster_idx_map;
@@ -637,16 +676,12 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
 
     int cluster_idx = 0;
     int flash_idx = 0;
-    for (auto it = cluster_bundles_map.begin(); it != cluster_bundles_map.end(); ++it) {
-      auto cluster = it->first;
-      auto index = cluster_idx;
-      cluster_idx_map[cluster] = index;
+    for (auto* cluster : clusters_ordered) {
+      cluster_idx_map[cluster] = cluster_idx;
       cluster_idx++;
     }
-    for (auto it = flash_bundles_map.begin(); it != flash_bundles_map.end(); ++it) {
-      auto flash = it->first;
-      auto index = flash_idx;
-      flash_idx_map[flash] = index;
+    for (auto* flash : flashes_ordered) {
+      flash_idx_map[flash] = flash_idx;
       flash_idx++;
     }
 
@@ -666,9 +701,8 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     size_t i = 0;  // flash index counter
     size_t ik = 0; // weights index counter
     log->debug("flash_bundles_map size {}", flash_bundles_map.size());
-    for (auto it = flash_bundles_map.begin(); it != flash_bundles_map.end(); ++it) {
-      auto flash = it->first;
-      auto bundles = it->second;
+    for (auto* flash : flashes_ordered) {
+      auto& bundles = flash_bundles_map[flash];
 
       for (uint j = 0; j < nopdet; j++) {
         auto opdet_idx = opdet_idx_v.at(j);
@@ -736,14 +770,13 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     Ress::vector_t solution = Ress::solve(X, y, params, initial, weights);
     log->debug("solution size {}", solution.size());
     int n = 0;
-    for (auto it = flash_bundles_map.begin(); it != flash_bundles_map.end(); ++it) {
-      auto flash = it->first;
-      auto bundles = it->second;
+    for (auto* flash : flashes_ordered) {
+      auto& bundles = flash_bundles_map[flash];
       for (size_t k = 0; k < bundles.size(); k++) {
         auto bundle = bundles.at(k);
         bundle->set_strength(solution(n));
 
-        if (solution(n) > 0.05 || m_beamonly) {
+        if (solution(n) > m_strength_cutoff || m_beamonly) {
           log->debug("second match: flash {} and cluster {}, time {}, meas PE {}, pred PE {}, "
                      "solution {}, ks_dis {}, chi2/ndf {}, consistent {}",
                      flash->get_flash_id(),
@@ -772,7 +805,7 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     // but one flash can be matched to multiple clusters
     std::map<int, std::pair<Opflash*, double>> matched_pairs;
     for (size_t i = 0; i != pairs.size(); i++) {
-      if (solution(i) > 0.05) {
+      if (solution(i) > m_strength_cutoff) {
         int cluster_idx = cluster_idx_map[pairs.at(i).second];
         auto flash = pairs.at(i).first;
         if (matched_pairs.find(cluster_idx) == matched_pairs.end()) {
@@ -862,7 +895,8 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
 
   } // end second matching round
 
-  for (auto [flash, bundles] : flash_bundles_map) {
+  for (auto* flash : flash_iter_order(flash_bundles_map)) {
+    auto& bundles = flash_bundles_map[flash];
     for (auto bundle : bundles) {
       bundle->get_main_cluster()->set_cluster_t0(flash->get_time() * units::ns);
       log->debug(
