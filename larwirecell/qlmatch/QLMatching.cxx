@@ -885,7 +885,8 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
         String::format("%s/%d-img-apa%d.json", sub_dir, m_bee_index, m_anode->ident()));
       // QLMatch::dump_bee_bundle(
       //   results_flash_bundles_map, global_cluster_idx_map, String::format("%s/%d-op-apa%d.json", sub_dir, m_bee_index, m_anode->ident()));
-      QLMatch::dump_bee_bundle(
+      QLMatch::dump_light(
+        flashes,
         flash_bundles_map,
         global_cluster_idx_map,
         String::format("%s/%d-op-apa%d.json", sub_dir, m_bee_index, m_anode->ident()));
