@@ -63,6 +63,11 @@ namespace WireCell::QLMatch {
     double m_flash_maxtime{1500e3};  // ns
     double m_beam_mintime{-5e3};     // ns
     double m_beam_maxtime{5e3};      // ns
+    // Beam-window threshold on |flash_time| (ns) used when tagging
+    // matched clusters with Clus::Facade::Flags::beam_flash and
+    // Flags::main_cluster.  Default 5e3 ns = 5 us matches uboone's
+    // beam_flash semantics.
+    double m_max_beam_flash_time{5e3};
     double m_QtoL{0.5};
     // LASSO solution threshold below which a (flash, cluster) bundle is
     // dropped after each matching round. Pulled out so the cutoff can be

@@ -7,6 +7,9 @@
 #include "WireCellAux/TensorDMdataset.h"
 #include "WireCellAux/TensorDMpointtree.h"
 #include "WireCellClus/Facade.h"
+// Flag names mirrored from WireCellClus/ClusteringFuncs.h ("main_cluster",
+// "beam_flash").  Inlined here rather than included to avoid pulling
+// Bee.h → miniz.h, which the larsoft mrb include path can't resolve.
 #include "WireCellUtil/Exceptions.h"
 #include "WireCellUtil/ExecMon.h"
 #include "WireCellUtil/NamedFactory.h"
@@ -15,6 +18,9 @@
 #include "WireCellUtil/String.h"
 #include "WireCellUtil/Units.h"
 
+#include <cmath>
+#include <limits>
+
 #include "art/Utilities/make_tool.h"
 #include "cetlib/filepath_maker.h"
 #include "fhiclcpp/ParameterSet.h"
@@ -22,11 +28,28 @@
 #include "larsim/PhotonPropagation/OpticalPathTools/OpticalPath.h"
 #include "larsim/PhotonPropagation/SemiAnalyticalModel.h"
 
-WIRECELL_FACTORY(QLMatching,
+// Factory name `wclsQLMatching` disambiguates the larwirecell-side QLMatching
+// from the wire-cell-toolkit-side `Match::QLMatching` (libWireCellMatch.so),
+// which both classes used to register under the same `QLMatching` string.
+// SBND wcls fcl/jsonnet should reference `wclsQLMatching` for this plugin.
+WIRECELL_FACTORY(wclsQLMatching,
                  WireCell::QLMatch::QLMatching,
                  WireCell::INamed,
                  WireCell::ITensorSetFanin,
                  WireCell::IConfigurable)
+
+// Forward declaration of the wire-cell-toolkit helper that pads every cluster
+// in a grouping with the union of flag_* keys.  Linked from libWireCellClus.so
+// (defined in clus/src/ClusteringFuncs.cxx).  Declared here rather than
+// `#include "WireCellClus/ClusteringFuncs.h"` to avoid pulling Bee.h/miniz.h
+// through the larsoft mrb include path.
+namespace WireCell::Clus::Facade {
+    class Grouping;
+    void normalize_cluster_flags(Grouping& grouping,
+                                 WireCell::Log::logptr_t log,
+                                 const std::string& grouping_name,
+                                 int ident);
+}
 
 using namespace WireCell;
 using namespace WireCell::Clus::Facade;
@@ -64,6 +87,8 @@ void WireCell::QLMatch::QLMatching::configure(const WireCell::Configuration& cfg
   }
 
   m_flash_minPE = get(cfg, "flash_minPE", m_flash_minPE);
+
+  m_max_beam_flash_time = get(cfg, "max_beam_flash_time", m_max_beam_flash_time);
 
   if (m_beamonly) {
     m_flash_mintime = m_beam_mintime;
@@ -104,6 +129,7 @@ WireCell::Configuration WireCell::QLMatch::QLMatching::default_configuration() c
   cfg["flash_maxtime"] = m_flash_maxtime;
   cfg["beam_mintime"] = m_beam_mintime;
   cfg["beam_maxtime"] = m_beam_maxtime;
+  cfg["max_beam_flash_time"] = m_max_beam_flash_time;
   cfg["QtoL"] = m_QtoL;
   cfg["strength_cutoff"] = m_strength_cutoff;
 
@@ -896,21 +922,62 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
 
   } // end second matching round
 
+  // Apply matched t0s and tag beam-window clusters with
+  // Clus::Facade::"beam_flash" / main_cluster so the downstream
+  // MABC pipeline (ClusteringTaggerFlagTransfer, ClusteringRecoveringBundle,
+  // TaggerCheckNeutrino, ...) can pick the in-beam main cluster.
+  //
+  // Selection rule (mirrors WCP for uboone):
+  //   - Any matched cluster whose flash satisfies |flash_time| <
+  //     m_max_beam_flash_time gets the beam_flash flag.
+  //   - Among those, the cluster whose flash has the smallest |time|
+  //     gets the main_cluster flag.
+  Cluster* main_cluster_candidate = nullptr;
+  double main_cluster_abs_time = std::numeric_limits<double>::infinity();
   for (auto* flash : flash_iter_order(flash_bundles_map)) {
     auto& bundles = flash_bundles_map[flash];
+    const double abs_flash_time = std::abs(flash->get_time());
+    const bool in_beam = abs_flash_time < m_max_beam_flash_time;
     for (auto bundle : bundles) {
-      bundle->get_main_cluster()->set_cluster_t0(flash->get_time() * units::ns);
+      auto* cluster = bundle->get_main_cluster();
+      cluster->set_cluster_t0(flash->get_time() * units::ns);
+      if (in_beam) {
+        cluster->set_flag("beam_flash");
+        if (abs_flash_time < main_cluster_abs_time) {
+          main_cluster_abs_time = abs_flash_time;
+          main_cluster_candidate = cluster;
+        }
+      }
       log->debug(
-        "flash_bundles_map: flash id {} time {} ns, cluster gidx {} total_pred_light {} t0 {}",
+        "flash_bundles_map: flash id {} time {} ns, cluster gidx {} total_pred_light {} t0 {} in_beam {}",
         flash->get_flash_id(),
         flash->get_time(),
-        global_cluster_idx_map[bundle->get_main_cluster()],
+        global_cluster_idx_map[cluster],
         bundle->get_total_pred_light(),
-        bundle->get_main_cluster()->get_cluster_t0());
+        cluster->get_cluster_t0(),
+        in_beam);
     }
+  }
+  if (main_cluster_candidate) {
+    main_cluster_candidate->set_flag("main_cluster");
+    log->debug("QLMatching: main_cluster tagged on cluster gidx {} "
+               "(|flash_time|={} ns, threshold={} ns)",
+               global_cluster_idx_map[main_cluster_candidate],
+               main_cluster_abs_time, m_max_beam_flash_time);
+  } else {
+    log->debug("QLMatching: no matched cluster within |flash_time| < {} ns; "
+               "main_cluster flag not set", m_max_beam_flash_time);
   }
 
   {
+    // Pad cluster_scalar so every live cluster carries the same flag_* keys.
+    // Without this, Aux::TensorDM::as_tensors silently drops flag values set
+    // on only a subset of clusters (Dataset::append uses the first cluster's
+    // schema), so the main_cluster / beam_flash flags set above would be lost
+    // at the QLMatching -> PointTreeMerging -> MABC tensor IO boundary, and
+    // TaggerCheckNeutrino would see no main_cluster.
+    Clus::Facade::normalize_cluster_flags(*grouping, log, "live", charge_ident);
+
     ITensor::vector outtens;
 
     auto tens_live = Aux::TensorDM::as_tensors(*root_live, inpath + "/live");
