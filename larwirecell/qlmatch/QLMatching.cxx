@@ -97,6 +97,7 @@ void WireCell::QLMatch::QLMatching::configure(const WireCell::Configuration& cfg
 
   m_QtoL = get(cfg, "QtoL", m_QtoL);
   m_strength_cutoff = get(cfg, "strength_cutoff", m_strength_cutoff);
+  m_saturation_threshold = get(cfg, "saturation_threshold", m_saturation_threshold);
 
   if (cfg["VUVEfficiency"].isArray()) {
     m_VUVEfficiency.clear();
@@ -132,6 +133,7 @@ WireCell::Configuration WireCell::QLMatch::QLMatching::default_configuration() c
   cfg["max_beam_flash_time"] = m_max_beam_flash_time;
   cfg["QtoL"] = m_QtoL;
   cfg["strength_cutoff"] = m_strength_cutoff;
+  cfg["saturation_threshold"] = m_saturation_threshold;
 
   return cfg;
 }
@@ -293,7 +295,7 @@ bool WireCell::QLMatch::QLMatching::operator()(const input_vector& invec, output
     // ! warning: this is a temporary fix to identify simulated saturated PMTs
     for (size_t idet = 0; idet < size_t(flash->get_num_channels()); idet++) {
       auto pe_det = flash->get_PE(idet);
-      if ((flash->get_total_PE() > 5000) & (pe_det == 0) & (m_data == false))
+      if ((flash->get_total_PE() > m_saturation_threshold) & (pe_det == 0) & (m_data == false))
         flash_opdet_mask[idet] = 0;
     }
 
