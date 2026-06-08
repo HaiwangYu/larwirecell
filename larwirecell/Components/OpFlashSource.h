@@ -44,6 +44,14 @@ namespace wcls {
     art::InputTag m_inputTag{};
 
     size_t m_npmts{312};
+
+    // sbnd::timing::FrameShiftInfo lookup label and verbose flag.  The
+    // FrameApplyAtCaf() shift (ns) is forwarded into the output TensorSet
+    // metadata as "frame_apply_at_caf" so downstream consumers can apply it
+    // when interpreting flash times.  Defaults reproduce the standard CAF
+    // chain ("frameshift" producer, no debug prints).
+    std::string fFrameLabel{"frameshift"};
+    bool fDebugFrame{false};
   };
 }
 

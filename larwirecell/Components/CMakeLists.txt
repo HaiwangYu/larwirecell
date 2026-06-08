@@ -31,6 +31,7 @@ cet_make_library(LIBRARY_NAME WireCellLarsoft
   WireCell::Util
   lardataobj::Simulation
   PRIVATE
+  sbnobj::SBND_Timing
   larevt::CalibrationDBI_IOVData
   larevt::ChannelStatusService
   larevt::ChannelStatusProvider

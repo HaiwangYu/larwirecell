@@ -10,10 +10,21 @@
 #include "art/Framework/Principal/Handle.h"
 #include "lardataobj/RecoBase/OpFlash.h"
 
+// sbnd::timing::FrameShiftInfo (sbnobj) is only available in recent sbnobj
+// versions.  Guard the include so older builds still compile -- when absent,
+// the per-event frame_apply_at_caf shift falls back to 0 (no shift).
+#if __has_include("sbnobj/SBND/Timing/FrameShiftInfo.hh")
+#define HAVE_SBND_FRAMESHIFTINFO 1
+#include "sbnobj/SBND/Timing/FrameShiftInfo.hh"
+#endif
+
 #include <boost/multi_array.hpp>
 
+#include <cctype>
 #include <cmath>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -37,6 +48,8 @@ WireCell::Configuration OpFlashSource::default_configuration() const
 {
   Configuration cfg;
   cfg["art_tag"] = ""; // how to look up the opflashes
+  cfg["frame_label"] = fFrameLabel;
+  cfg["debug_frame"] = fDebugFrame;
   return cfg;
 }
 
@@ -47,6 +60,8 @@ void OpFlashSource::configure(const WireCell::Configuration& cfg)
     THROW(ValueError() << errmsg{"WireCell::OpFlashSource requires a source_label"});
   }
   m_inputTag = cfg["art_tag"].asString();
+  if (cfg.isMember("frame_label")) fFrameLabel = cfg["frame_label"].asString();
+  if (cfg.isMember("debug_frame")) fDebugFrame = cfg["debug_frame"].asBool();
 }
 
 void OpFlashSource::visit(art::Event& event)
@@ -85,7 +100,70 @@ void OpFlashSource::visit(art::Event& event)
   auto tensor = std::make_shared<SimpleTensor>(shape, array.data(), md);
   ITensor::vector* itv = new ITensor::vector;
   itv->push_back(tensor);
+
+  // Look up the SBND FrameShift product and forward FrameApplyAtCaf() (the
+  // CAF-stage frame shift in ns) into the output TensorSet metadata as
+  // "frame_apply_at_caf".  Defaults to 0 (no shift) when the product is
+  // absent OR the sbnobj header is not available at compile time.
+  double _frame_apply_at_caf = 0.0;
+#ifdef HAVE_SBND_FRAMESHIFTINFO
+  {
+    art::Handle<sbnd::timing::FrameShiftInfo> frameHandle;
+    event.getByLabel(fFrameLabel, frameHandle);
+    if (!frameHandle.isValid()) {
+      if (fDebugFrame) std::cout << "No FrameShift products found." << std::endl;
+    }
+    else {
+      sbnd::timing::FrameShiftInfo const& frame(*frameHandle);
+      _frame_apply_at_caf = frame.FrameApplyAtCaf();
+    }
+  }
+#endif
+
+  // Debug CSV: append one row per flash to ./debug.csv.  Header is written on
+  // first call to this OpFlashSource process (m_count==0 across all instances
+  // is hard to coordinate, so each instance checks for file existence instead).
+  // All times in us; frame_apply_at_caf is converted from ns at write time.
+  // tpcid is parsed from the instance name (e.g. m_inputTag.instance() looks
+  // like "tpc0" or "tpc1" with the legacy fcl).
+  {
+    static const std::string csv_path = "debug.csv";
+    const bool need_header = ![]{
+      std::ifstream f(csv_path); return f.good();
+    }();
+    std::ofstream csv(csv_path, std::ios::app);
+    if (need_header) {
+      csv << "event,flashid,tpcid,opflash_time_us,opflash_abstime_us,frame_apply_at_caf_us\n";
+    }
+    int tpcid = -1;
+    {
+      // The TPC id is encoded in the producer label like "opflashtpc0" /
+      // "opflashtpc1".  Fall back to the instance string for setups that
+      // attach :tpc0/:tpc1 there.
+      auto extract_last_digit = [](const std::string& s) {
+        for (auto it = s.rbegin(); it != s.rend(); ++it) {
+          if (std::isdigit(static_cast<unsigned char>(*it))) return *it - '0';
+        }
+        return -1;
+      };
+      tpcid = extract_last_digit(m_inputTag.label());
+      if (tpcid < 0) tpcid = extract_last_digit(m_inputTag.instance());
+    }
+    const double fc_us = _frame_apply_at_caf / units::microsecond;
+    int flashid = 0;
+    for (auto const& opflash : *opflashes) {
+      csv << event.event() << ','
+          << flashid << ','
+          << tpcid << ','
+          << opflash.Time() << ','
+          << opflash.AbsTime() << ','
+          << fc_us << '\n';
+      ++flashid;
+    }
+  }
+
   Configuration set_md;
+  set_md["frame_apply_at_caf"] = _frame_apply_at_caf;
   auto tset = std::make_shared<SimpleTensorSet>(event.event(), set_md, ITensor::shared_vector(itv));
   m_tensorsets.push_back(tset);
   m_tensorsets.push_back(nullptr);
