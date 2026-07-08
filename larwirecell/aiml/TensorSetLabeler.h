@@ -15,6 +15,12 @@
  * Track level truth: a new 2D "truth_per_track" tensor, one row per
  * simb::MCParticle (cf. Ningclover TrackIDPIDMap2h5.cxx).  Columns are listed
  * in the tensor metadata "columns"; units are LArSoft native (cm, ns, GeV).
+ * With "truth_tracks_nu_only" (default true) only BEAM-neutrino primaries
+ * are saved (assns MCTruth Origin()==kBeamNeutrino && primary, the larreco
+ * CellTree "nuOnly" cut) -- no cosmic-muon truth.  Rockbox events can carry
+ * several beam-nu interactions: primaries of ALL of them are kept and the
+ * "nu_idx" column records each row's MCTruth index (0 = the interaction
+ * the nu_* metadata describes; -1 = non-beam rows in the full table).
  *
  * Blob level truth: for each blob node of the "live" grouping the dominant
  * G4 track id is written into the blob "scalar" PC as "trackid" (int, -1 if
@@ -41,9 +47,32 @@
  * Note we use the non-t0-corrected raw coordinates and the priorSCE
  * (true position) depos; SCE displacement (<~1cm) is well below blob size.
  *
- * Debug Bee output: when "bee_sink" names a Clus::IBeeSink, a
- * "truth_trackid" Bee points set is written per event: every blob "3d" point
- * in raw coords with cluster_id = the blob's truth trackid.
+ * SCE CORRECTION (default on when "sce_field" is set).  The blobs are
+ * reconstructed from post-SCE (spatially distorted) charge while the
+ * ionandscint:priorSCE depos are at TRUE positions -- up to ~1.4 cm apart,
+ * i.e. several 3mm wire pitches.  When "sce_field" names an ISCEField
+ * carrying the TrueFwd (true->reco) displacement map (a second SCEFieldTH3
+ * on the SBND dualmap with th3_name_* = TrueFwd_Displacement_*, sign=1),
+ * each depo is shifted x += dx(x,y,z) etc. before the association, making a
+ * "postSCE" SimEnergyDeposit set on the fly.  "sce_correction" (default
+ * true) gates the application without unwiring the component.
+ *
+ * Debug Bee output: when "bee_sink" names a Clus::IBeeSink, per event:
+ *   - "truth_trackid": every blob "3d" point in raw coords with
+ *     cluster_id = the blob's truth trackid,
+ *   - "truth_unlabeled": only the points of UNlabeled blobs (trackid<0),
+ *     cluster_id = the reco cluster ident, to eyeball what fails to match,
+ *   - "mc" (data/{i}/{i}-mc.json): a jstree particle-flow tree of the
+ *     MCParticles with KE > "pf_ke_min" (default 10 MeV) and, when
+ *     "pf_fiducial" names an IFiducial, an FV cut: start or end point
+ *     inside the fiducial volume OR the start-end line section crossing
+ *     it.  Particles derived from a beam neutrino (assns MCTruth
+ *     Origin()==kBeamNeutrino) skip the FV cut.  With "pf_nu_only"
+ *     (default true) ONLY beam-nu-derived particles enter the tree --
+ *     no cosmics at all; false restores the FV-crossing cosmics.
+ *     Children nest under their nearest KEPT ancestor via Mother()
+ *     tracing; node id = G4 trackid (cross-references the truth_trackid
+ *     cluster ids).
  */
 
 #ifndef LARWIRECELL_AIML_TENSORSETLABELER
@@ -52,6 +81,8 @@
 #include "WireCellAux/Logger.h"
 #include "WireCellClus/IBeeSink.h"
 #include "WireCellIface/IAnodePlane.h"
+#include "WireCellIface/IFiducial.h"
+#include "WireCellIface/ISCEField.h"
 #include "WireCellIface/IConfigurable.h"
 #include "WireCellIface/ITensorSetFilter.h"
 #include "WireCellIface/ITerminal.h"
@@ -115,6 +146,12 @@ namespace WireCell::AIML {
     double m_tick;             // sampling period
     int m_wire_slop{1};        // accept depos this many wires outside blob bounds
     int m_tick_slop{2};        // accept depos this many ticks outside blob slice
+    bool m_sce_correction{true};   // apply true->reco SCE shift to depos
+    bool m_truth_tracks_nu_only{true}; // truth_per_track: only nu-origin particles
+    bool m_pf_nu_only{true};           // "mc" tree: only beam-nu-derived particles
+    double m_pf_ke_min;            // KE cut for the Bee "mc" particle tree
+    ISCEField::pointer m_sce{nullptr}; // TrueFwd (true->reco) displacement map
+    IFiducial::pointer m_pf_fiducial{nullptr}; // FV cut for the "mc" tree
     std::vector<IAnodePlane::pointer> m_anodes;
     std::map<std::pair<int, int>, FaceCtx> m_faces; // (apa,face) -> ctx
 
@@ -122,6 +159,8 @@ namespace WireCell::AIML {
     Clus::IBeeSink::pointer m_bee_sink{nullptr};
     std::string m_bee_detector{"sbnd"};
     std::string m_bee_algorithm{"truth_trackid"};
+    std::string m_bee_unlabeled_algorithm{"truth_unlabeled"};
+    std::string m_bee_pf_name{"mc"};
     int m_bee_index{0};
 
     // per-event truth captured in visit()
@@ -129,6 +168,7 @@ namespace WireCell::AIML {
     WireCell::Configuration m_evtmd;         // nu_* metadata
     std::vector<std::vector<double>> m_tracks; // truth_per_track rows
     std::vector<Depo> m_depos;
+    WireCell::Configuration m_pf_particles;  // Bee "mc" jstree node array
 
     size_t m_count{0};
   };
