@@ -80,7 +80,14 @@ AIML::TensorSetLabeler::TensorSetLabeler()
   , m_drift_speed(1.563 * units::mm / units::us)
   , m_time_offset(-205 * units::us)
   , m_tick(0.5 * units::us)
+  , m_DL(4.0 * units::cm * units::cm / units::s)   // wcsimsp_sbnd.fcl DL
+  , m_DT(8.8 * units::cm * units::cm / units::s)   // wcsimsp_sbnd.fcl DT
+  , m_sp_smear_time(1.0 / (2 * 3.141592653589793 * 0.10 * units::megahertz))
   , m_pf_ke_min(10 * units::MeV)
+    // = 1.59 us: Gaus_wide sigma = 0.10 MHz (sbnd sp-filters.jsonnet),
+    // sigma_t = 1/(2*pi*f) per dunereco docs/smear-dnn-campaign.md.
+    // sp_smear_wire defaults (pitch units) = 1/(2*sqrt(pi)*k) with
+    // k = 1.05 (Wire_ind) / 3.60 (Wire_col) from the same jsonnet.
 {}
 
 AIML::TensorSetLabeler::~TensorSetLabeler() {}
@@ -104,6 +111,20 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   // for the diffusion extents BlobDepoFill integrates (point-like depos).
   cfg["wire_slop"] = m_wire_slop;
   cfg["tick_slop"] = m_tick_slop;
+  // readout length in ticks; used to clip the truth_depo_sce Bee display
+  // to the window blobs can exist in.
+  cfg["nticks"] = m_nticks;
+  // Depo diffusion (see header): drift diffusion DL/DT + SP filter smearing
+  // (time sigma + per-plane-type wire sigma in pitch units); acceptance is
+  // widened by nsigma * the quadrature sum.
+  cfg["DL"] = m_DL;
+  cfg["DT"] = m_DT;
+  cfg["sp_smear_time"] = m_sp_smear_time;
+  cfg["sp_smear_wire_ind"] = m_sp_smear_wire_ind;
+  cfg["sp_smear_wire_col"] = m_sp_smear_wire_col;
+  cfg["nsigma"] = m_nsigma;
+  // truth_depo_sce Bee set: Gaussian samples per depo diffusion ball.
+  cfg["n_sample_truth_depo_sce"] = m_nsample_depo;
   // ISCEField with the TrueFwd (true->reco) displacement map; empty = off.
   cfg["sce_field"] = "";
   cfg["sce_correction"] = m_sce_correction;
@@ -140,6 +161,14 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
   m_tick = get(cfg, "tick", m_tick);
   m_wire_slop = get(cfg, "wire_slop", m_wire_slop);
   m_tick_slop = get(cfg, "tick_slop", m_tick_slop);
+  m_nticks = get(cfg, "nticks", m_nticks);
+  m_DL = get(cfg, "DL", m_DL);
+  m_DT = get(cfg, "DT", m_DT);
+  m_sp_smear_time = get(cfg, "sp_smear_time", m_sp_smear_time);
+  m_sp_smear_wire_ind = get(cfg, "sp_smear_wire_ind", m_sp_smear_wire_ind);
+  m_sp_smear_wire_col = get(cfg, "sp_smear_wire_col", m_sp_smear_wire_col);
+  m_nsigma = get(cfg, "nsigma", m_nsigma);
+  m_nsample_depo = get(cfg, "n_sample_truth_depo_sce", m_nsample_depo);
   m_sce_correction = get(cfg, "sce_correction", m_sce_correction);
   m_truth_tracks_nu_only = get(cfg, "truth_tracks_nu_only", m_truth_tracks_nu_only);
   m_pf_nu_only = get(cfg, "pf_nu_only", m_pf_nu_only);
@@ -160,6 +189,9 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
       const auto& bb = sens.bounds();
       fc.xmin = std::min(bb.first.x(), bb.second.x());
       fc.xmax = std::max(bb.first.x(), bb.second.x());
+      for (int ip = 0; ip < 3; ++ip) {
+        fc.pitch[ip] = face->raygrid().pitch_mags()[2 + ip];
+      }
       m_faces[{anode->ident(), face->which()}] = fc;
     }
   }
@@ -209,6 +241,13 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
     log->debug("using shared Bee sink {} for '{}' dump", bee_tn, m_bee_algorithm);
   }
 
+  log->debug("depo diffusion: DL {} DT {} cm2/s, SP smear time {} us, "
+             "wire ind/col {}/{} pitch, nsigma {}, depo-ball samples {}",
+             m_DL / (units::cm * units::cm / units::s),
+             m_DT / (units::cm * units::cm / units::s),
+             m_sp_smear_time / units::us,
+             m_sp_smear_wire_ind, m_sp_smear_wire_col,
+             m_nsigma, m_nsample_depo);
   log->debug("labeling '{}' at '{}': depos '{}', mctruth '{}', mcparticles '{}', "
              "drift_speed {} mm/us, time_offset {} us, depo_time_offset {} us, tick {} us",
              m_grouping,
@@ -518,9 +557,20 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     int wip[3];
     int trackid;
     double weight;
+    double stick;    // diffusion+SP sigma along drift, in ticks
+    double swire[3]; // diffusion+SP sigma along pitch, in wires, per plane
   };
   std::map<std::pair<int, int>, std::unordered_map<int, std::vector<PDepo>>> proj;
   size_t nproj = 0;
+  // SCE-shifted SimEnergyDeposit cloud, drawn at the DRIFTED (apparent)
+  // position that directly fills the blobs: x_app (drift + t_dep shift) at
+  // the post-SCE y,z -- overlays the raw-coordinate blob points exactly.
+  Bee::Points bpts_depo(m_bee_detector, m_bee_depo_algorithm);
+  bpts_depo.rse(m_run, m_sub, m_evt);
+  const bool dump_depo = m_bee_sink && m_sce && m_sce_correction;
+  const int nsample = std::max(1, m_nsample_depo);
+  std::normal_distribution<double> gaus(0.0, 1.0);
+  double max_stick = 0; // widest depo time-sigma, sets the blob tick window
   for (const auto& d : m_depos) {
     const double tdep = d.t + m_depo_time_offset;
     for (const auto& [af, fc] : m_faces) {
@@ -532,6 +582,36 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       PDepo pd;
       pd.trackid = d.trackid;
       pd.weight = d.weight;
+      // Diffusion ball: drift diffusion sigma = sqrt(2*D*t_drift) from the
+      // ACTUAL drift distance, plus the SP filter smearing, in quadrature.
+      {
+        const double t_drift = std::max(0.0, (d.x - fc.xw) * fc.dirx / m_drift_speed);
+        const double sigL = std::sqrt(2 * m_DL * t_drift); // longitudinal (drift/time)
+        const double sigT = std::sqrt(2 * m_DT * t_drift); // transverse (pitch)
+        const double sig_time = std::sqrt(sigL / m_drift_speed * (sigL / m_drift_speed) +
+                                          m_sp_smear_time * m_sp_smear_time);
+        pd.stick = sig_time / m_tick;
+        for (int ip = 0; ip < 3; ++ip) {
+          const double spw = (ip < 2 ? m_sp_smear_wire_ind : m_sp_smear_wire_col) * fc.pitch[ip];
+          pd.swire[ip] = std::sqrt(sigT * sigT + spw * spw) / fc.pitch[ip];
+        }
+        max_stick = std::max(max_stick, pd.stick);
+      }
+      // Draw only depos whose apparent position lands inside the readout
+      // window (blobs only exist for ticks [0, nticks)); far-out-of-time
+      // depos (e.g. radiologicals) would fly off to |x|~km otherwise.
+      // Sample nsample points from the diffusion ball (q split evenly);
+      // the transverse display sigma uses the U-plane (largest) value.
+      if (dump_depo && itick >= -m_tick_slop && itick < m_nticks + m_tick_slop) {
+        const double sig_x = pd.stick * m_tick * m_drift_speed;
+        const double sig_yz = pd.swire[0] * fc.pitch[0];
+        for (int k = 0; k < nsample; ++k) {
+          bpts_depo.append(Point(x_app + gaus(m_rng) * sig_x,
+                                 d.y + gaus(m_rng) * sig_yz,
+                                 d.z + gaus(m_rng) * sig_yz),
+                           d.weight / nsample, d.trackid, d.trackid);
+        }
+      }
       const Point pos(d.x, d.y, d.z);
       // Wire-in-plane indices from the face RayGrid -- the same coordinates
       // the tiling used to define the blob strip bounds (layers 2,3,4 =
@@ -555,6 +635,7 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   bpts.rse(m_run, m_sub, m_evt);
   Bee::Points bpts_unlab(m_bee_detector, m_bee_unlabeled_algorithm);
   bpts_unlab.rse(m_run, m_sub, m_evt);
+
   size_t nblobs = 0, nlabeled = 0;
   for (auto* cnode : root->children()) {
     // reco cluster ident, used as the cluster_id of the unlabeled dump
@@ -587,13 +668,21 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       auto pit = proj.find({wpid.apa(), wpid.face()});
       if (pit != proj.end()) {
         std::unordered_map<int, double> acc;
-        for (int itick = smin - m_tick_slop; itick < smax + m_tick_slop; ++itick) {
+        // Gaussian acceptance: a depo fills the blob when its center lies
+        // within (slop + nsigma*sigma) of the blob bounds, per dimension.
+        const int twin = m_tick_slop + (int)std::ceil(m_nsigma * max_stick);
+        for (int itick = smin - twin; itick < smax + twin; ++itick) {
           auto bit = pit->second.find(itick);
           if (bit == pit->second.end()) { continue; }
           for (const auto& pd : bit->second) {
+            const double tout = itick < smin  ? (double)(smin - itick) :
+                                itick >= smax ? (double)(itick - smax + 1) : 0.0;
+            if (tout > m_tick_slop + m_nsigma * pd.stick) { continue; }
             bool inside = true;
             for (int ip = 0; ip < 3; ++ip) {
-              if (pd.wip[ip] < wmin[ip] - m_wire_slop || pd.wip[ip] >= wmax[ip] + m_wire_slop) {
+              const double wout = pd.wip[ip] < wmin[ip]  ? (double)(wmin[ip] - pd.wip[ip]) :
+                                  pd.wip[ip] >= wmax[ip] ? (double)(pd.wip[ip] - wmax[ip] + 1) : 0.0;
+              if (wout > m_wire_slop + m_nsigma * pd.swire[ip]) {
                 inside = false;
                 break;
               }
@@ -685,6 +774,9 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   if (m_bee_sink) {
     m_bee_sink->write(bpts, m_bee_index, m_run, m_sub, m_evt);
     m_bee_sink->write(bpts_unlab, m_bee_index, m_run, m_sub, m_evt);
+    if (!bpts_depo.empty()) {
+      m_bee_sink->write(bpts_depo, m_bee_index, m_run, m_sub, m_evt);
+    }
     if (!m_pf_particles.empty()) {
       Bee::ParticleTree pf(m_bee_pf_name);
       pf.set_particles(m_pf_particles);

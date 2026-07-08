@@ -62,6 +62,14 @@
  *     cluster_id = the blob's truth trackid,
  *   - "truth_unlabeled": only the points of UNlabeled blobs (trackid<0),
  *     cluster_id = the reco cluster ident, to eyeball what fails to match,
+ *   - "truth_depo_sce" (only when the SCE correction is applied): the
+ *     SimEnergyDeposit points after the true->reco SCE shift, drawn at the
+ *     DRIFTED apparent position that fills the blobs (x_app = x +
+ *     dirx*drift_speed*t_dep at the post-SCE y,z), cluster_id = the truth
+ *     trackid, q = the truth charge (NumElectrons).  Each depo is a
+ *     diffusion "ball" (drift diffusion + SP filter smearing, see the
+ *     header of the diffusion config block); "n_sample_truth_depo_sce"
+ *     (default 1) points are Gaussian-sampled per ball (q split evenly),
  *   - "mc" (data/{i}/{i}-mc.json): a jstree particle-flow tree of the
  *     MCParticles with KE > "pf_ke_min" (default 10 MeV) and, when
  *     "pf_fiducial" names an IFiducial, an FV cut: start or end point
@@ -89,6 +97,7 @@
 #include "larwirecell/Interfaces/IArtEventVisitor.h"
 
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -131,6 +140,7 @@ namespace WireCell::AIML {
       double xw;   // collection (W) plane x, as BlobSampler::plane_x(2)
       int dirx;    // face normal sign
       double xmin, xmax; // sensitive x extent
+      double pitch[3];   // raygrid pitch magnitude per plane (u,v,w)
     };
 
     // config
@@ -146,6 +156,24 @@ namespace WireCell::AIML {
     double m_tick;             // sampling period
     int m_wire_slop{1};        // accept depos this many wires outside blob bounds
     int m_tick_slop{2};        // accept depos this many ticks outside blob slice
+    int m_nticks{3400};        // readout ticks (clips the depo Bee display)
+    // Diffusion of the (point-like) SimEnergyDeposits before blob filling:
+    // (1) drift diffusion sigma = sqrt(2*D*t_drift) with DL/DT from the
+    //     detsim (sbndcode wcsimsp_sbnd.fcl), longitudinal (-> time) and
+    //     transverse (-> wire pitch) w.r.t. the drift;
+    // (2) signal-processing filter smearing (dunereco
+    //     docs/smear-dnn-campaign.md): time sigma = 1/(2*pi*f) with f the
+    //     Gaus_wide HfFilter sigma, wire sigma = 1/(2*sqrt(pi)*k) [pitch]
+    //     with k from Wire_ind/Wire_col (sbnd sp-filters.jsonnet).
+    // Both are added in quadrature per depo; a blob accepts the depo when
+    // its center is within (slop + nsigma*sigma) of the blob bounds.
+    double m_DL;               // longitudinal diffusion [area/time]
+    double m_DT;               // transverse diffusion [area/time]
+    double m_sp_smear_time;    // SP time smearing sigma [time]
+    double m_sp_smear_wire_ind{0.26875}; // SP wire smearing, U/V [pitch units]
+    double m_sp_smear_wire_col{0.07839}; // SP wire smearing, W [pitch units]
+    double m_nsigma{3.0};      // Gaussian acceptance half-width
+    int m_nsample_depo{1};     // truth_depo_sce Bee: samples per depo ball
     bool m_sce_correction{true};   // apply true->reco SCE shift to depos
     bool m_truth_tracks_nu_only{true}; // truth_per_track: only nu-origin particles
     bool m_pf_nu_only{true};           // "mc" tree: only beam-nu-derived particles
@@ -160,6 +188,7 @@ namespace WireCell::AIML {
     std::string m_bee_detector{"sbnd"};
     std::string m_bee_algorithm{"truth_trackid"};
     std::string m_bee_unlabeled_algorithm{"truth_unlabeled"};
+    std::string m_bee_depo_algorithm{"truth_depo_sce"};
     std::string m_bee_pf_name{"mc"};
     int m_bee_index{0};
 
@@ -171,6 +200,7 @@ namespace WireCell::AIML {
     WireCell::Configuration m_pf_particles;  // Bee "mc" jstree node array
 
     size_t m_count{0};
+    std::mt19937 m_rng{20260708}; // fixed seed: deterministic depo-ball sampling
   };
 }
 
