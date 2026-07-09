@@ -487,7 +487,11 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       d.y = sed.MidPointY() * units::cm;
       d.z = sed.MidPointZ() * units::cm;
       d.t = sed.Time() * units::ns;
-      d.trackid = sed.TrackID();
+      // larg4 marks deposits from DROPPED (unsaved) descendants -- e.g.
+      // delta rays along a muon -- with the NEGATIVE of the saved ancestor
+      // trackid.  Fold them into the ancestor, else the blob sections where
+      // delta-ray charge dominates come out "unlabeled" (tid<0).
+      d.trackid = std::abs(sed.TrackID());
       d.weight = sed.NumElectrons() > 0 ? (double)sed.NumElectrons() : sed.Energy();
       if (do_sce) {
         // "postSCE" on the fly: shift the true position by the TrueFwd
@@ -719,8 +723,10 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
           const double q = scalar.get("charge")->elements<double>()[0];
           const double qpp = x.size() ? std::max(q / x.size(), 1.0) : 1.0;
           for (size_t i = 0; i < x.size(); ++i) {
-            bpts.append(Point(x[i], y[i], z[i]), qpp, tid, tid);
-            if (tid < 0) {
+            if (tid >= 0) {
+              bpts.append(Point(x[i], y[i], z[i]), qpp, tid, tid);
+            }
+            else {
               bpts_unlab.append(Point(x[i], y[i], z[i]), qpp, reco_clid, reco_clid);
             }
           }

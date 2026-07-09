@@ -29,7 +29,10 @@
  * u/v/w wire-in-plane index) coordinate on its anode face and matched
  * against the blob's slice_index_[min,max) and {u,v,w}_wire_index_[min,max)
  * bounds; per-blob charge (NumElectrons) is accumulated per track id and the
- * argmax wins.
+ * argmax wins.  Deposits from dropped (unsaved) descendants carry the
+ * NEGATIVE ancestor trackid in larg4 -- they are folded into the saved
+ * ancestor via abs(TrackID) so delta-ray-dominated blob sections stay
+ * labeled with their parent track.
  *
  * TIME OFFSET GUIDANCE.  The raw (non-t0-corrected) blob x is defined by
  * BlobSampler::time2drift: x = x_Wplane + dirx*(t_sig + time_offset)*drift_speed
@@ -58,8 +61,8 @@
  * true) gates the application without unwiring the component.
  *
  * Debug Bee output: when "bee_sink" names a Clus::IBeeSink, per event:
- *   - "truth_trackid": every blob "3d" point in raw coords with
- *     cluster_id = the blob's truth trackid,
+ *   - "truth_trackid_labeled": the "3d" points of LABELED blobs only, in
+ *     raw coords with cluster_id = the blob's truth trackid,
  *   - "truth_unlabeled": only the points of UNlabeled blobs (trackid<0),
  *     cluster_id = the reco cluster ident, to eyeball what fails to match,
  *   - "truth_depo_sce" (only when the SCE correction is applied): the
@@ -186,7 +189,7 @@ namespace WireCell::AIML {
     // optional shared Bee sink for the truth_trackid debug dump
     Clus::IBeeSink::pointer m_bee_sink{nullptr};
     std::string m_bee_detector{"sbnd"};
-    std::string m_bee_algorithm{"truth_trackid"};
+    std::string m_bee_algorithm{"truth_trackid_labeled"};
     std::string m_bee_unlabeled_algorithm{"truth_unlabeled"};
     std::string m_bee_depo_algorithm{"truth_depo_sce"};
     std::string m_bee_pf_name{"mc"};
