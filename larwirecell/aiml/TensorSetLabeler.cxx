@@ -390,7 +390,32 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
   }
 
   // --- Bee "mc" particle-flow tree: MCParticles with KE > pf_ke_min,
-  // nested under the nearest KEPT ancestor by Mother() tracing ---
+  // nested under the nearest KEPT ancestor by Mother() tracing.  Particles
+  // are GROUPED under a per-interaction "initial mother neutrino" node
+  // built from the generator MCTruth (rockbox events carry several beam-nu
+  // interactions per event), keyed by the assns MCTruth index (nu_index).
+  struct NuNode {
+    bool valid{false};
+    int pdg{0};
+    double ke_mev{0}, vx{0}, vy{0}, vz{0};
+  };
+  std::vector<NuNode> nutruths;
+  if (mctruth_handle.isValid()) {
+    for (const auto& mct : *mctruth_handle) {
+      NuNode nn;
+      if (mct.NeutrinoSet()) {
+        const auto& nu_p = mct.GetNeutrino().Nu();
+        nn.valid = true;
+        nn.pdg = nu_p.PdgCode();
+        nn.ke_mev = (nu_p.Momentum(0).E() - nu_p.Mass()) * 1e3;
+        const auto& pos = nu_p.Position(0);
+        nn.vx = pos.X();
+        nn.vy = pos.Y();
+        nn.vz = pos.Z();
+      }
+      nutruths.push_back(nn);
+    }
+  }
   m_pf_particles = Json::arrayValue;
   if (mcps.isValid()) {
     std::unordered_map<int, const simb::MCParticle*> by_tid;
@@ -429,7 +454,8 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       return fv_ok(p);
     };
     std::unordered_map<int, std::vector<int>> pf_children; // kept parent -> kept kids
-    std::vector<int> pf_roots;
+    std::map<int, std::vector<int>> pf_nu_roots; // nu_index -> interaction-level tids
+    std::vector<int> pf_roots;                   // non-beam (cosmic) roots
     for (const auto& p : *mcps) {
       if (!kept(p)) { continue; }
       int anc = p.Mother();
@@ -439,7 +465,15 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
         if (kept(*it->second)) { break; }
         anc = it->second->Mother();
       }
-      if (anc > 0 && by_tid.count(anc)) { pf_children[anc].push_back(p.TrackId()); }
+      if (anc > 0 && by_tid.count(anc)) {
+        pf_children[anc].push_back(p.TrackId());
+        continue;
+      }
+      // interaction-level particle: group under its mother neutrino node
+      const auto iit = tid2idx.find(p.TrackId());
+      const int nidx = (iit != tid2idx.end() && iit->second < nu_index.size())
+                         ? nu_index[iit->second] : -1;
+      if (nidx >= 0) { pf_nu_roots[nidx].push_back(p.TrackId()); }
       else { pf_roots.push_back(p.TrackId()); }
     }
     std::function<Configuration(int)> make_pf_node = [&](int tid) -> Configuration {
@@ -470,6 +504,35 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       if (node["children"].empty()) { node["icon"] = "jstree-file"; }
       return node;
     };
+    // One root node per beam-nu interaction that has kept particles: the
+    // initial mother neutrino, with start = end = the interaction vertex.
+    for (const auto& [nidx, tids] : pf_nu_roots) {
+      Configuration nu_node;
+      // synthetic id: below the 1e7 GENIE trackid-offset range, unique per
+      // interaction, no collision with G4 trackids.
+      nu_node["id"] = 9000000 + nidx;
+      char text[64];
+      if (nidx < (int)nutruths.size() && nutruths[nidx].valid) {
+        const auto& nn = nutruths[nidx];
+        std::snprintf(text, sizeof(text), "%s  %.1f MeV",
+                      pdg_name(nn.pdg).c_str(), nn.ke_mev);
+        Configuration dj;
+        dj["start"][0] = nn.vx; // cm, as Bee wants
+        dj["start"][1] = nn.vy;
+        dj["start"][2] = nn.vz;
+        dj["end"] = dj["start"];
+        nu_node["data"] = dj;
+      }
+      else {
+        std::snprintf(text, sizeof(text), "nu interaction %d", nidx);
+      }
+      nu_node["text"] = text;
+      nu_node["children"] = Json::arrayValue;
+      for (int tid : tids) {
+        nu_node["children"].append(make_pf_node(tid));
+      }
+      m_pf_particles.append(nu_node);
+    }
     for (int tid : pf_roots) {
       m_pf_particles.append(make_pf_node(tid));
     }

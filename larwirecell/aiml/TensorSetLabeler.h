@@ -83,7 +83,11 @@
  *     no cosmics at all; false restores the FV-crossing cosmics.
  *     Children nest under their nearest KEPT ancestor via Mother()
  *     tracing; node id = G4 trackid (cross-references the truth_trackid
- *     cluster ids).
+ *     cluster ids).  Interaction-level particles are GROUPED under a
+ *     per-interaction "initial mother neutrino" node built from the
+ *     generator MCTruth (id = 9000000 + nu_idx; start = end = the
+ *     interaction vertex; name/KE from the MCTruth neutrino) -- rockbox
+ *     events carry several beam-nu interactions per event.
  */
 
 #ifndef LARWIRECELL_AIML_TENSORSETLABELER

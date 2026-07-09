@@ -33,15 +33,22 @@ attaches truth to the clustering ITensorSet (a serialized PointCloud tree):
   (unlabeled blob points, cluster_id = reco cluster ident),
   `truth_depo_sce` (the depo cloud at the drifted apparent positions,
   sampled from the diffusion balls, clipped to the readout window), and a
-  `{i}-mc.json` jstree particle-flow tree (beam-nu-derived particles with
-  KE > 10 MeV, nearest-kept-ancestor nesting, node id = trackid).
+  `{i}-mc.json` jstree particle-flow tree: beam-nu-derived particles with
+  KE > 10 MeV, nearest-kept-ancestor nesting, node id = trackid, GROUPED
+  under one "initial mother neutrino" root node per beam-nu interaction
+  (built from the generator MCTruth since largeant does not reliably save
+  the initial neutrino; id = 9000000 + nu_idx, start = end = the
+  interaction vertex, name/KE from the MCTruth neutrino) -- rockbox events
+  carry several interactions per event.
 
 **Tested** on 10 corsika+GENIE rockbox MC events (runs 32/31): blobs
 labeled per event 97/74/59/80/95/88/88/76/84/91% (points labeled higher);
 nearest-neighbor trackid coherence 100.0% on 8 events, 99.9%/99.6% on the
 other two.  The unlabeled remainder is dominated by real ghosts, especially
-isochronous tracks.  Latest BEE set (10 events, all truth sets + clustering):
-https://www.phy.bnl.gov/twister/bee/set/50110108-50fd-4288-aa59-ca2da05e7fc2/event/list/
+isochronous tracks.  Per-event mc trees carry 1-3 mother-neutrino roots
+(multi-interaction rockbox events group correctly).  Latest BEE set
+(10 events, all truth sets + clustering):
+https://www.phy.bnl.gov/twister/bee/set/90ee02b9-acba-4d8e-90c1-8a28df6fa240/event/list/
 
 # Section 2: pitfalls and conventions
 
@@ -102,10 +109,18 @@ Pimpos `region_binning()` index matches the strip convention.
 
 ## 2.6 Truth-particle conventions (trackid-offset scheme)
 
-- GENIE particles carry trackids offset by 1e7, corsika by 2e7; a GENIE
-  primary's `Mother()` is the offset root (e.g. 10000000), NOT 0 — the
-  larreco CellTree `Mother()==0` primary test finds nothing.  Use
-  `Process()=="primary"` (keep `Mother()==0` as a legacy OR).
+- WHY the 1e7/2e7 offsets: the SBND G4 stage runs TWO Geant4 instances per
+  event (`larg4intime` / `larg4outtime`), each numbering tracks from 1;
+  `MergeSimSources` (`mergesimsources_sbnd.fcl`:
+  `InputSourcesLabels: [larg4intime, larg4outtime]`,
+  `TrackIDOffsets: [10000000, 20000000]`) merges them into the single
+  `largeant` products, adding the per-source offset to every track AND
+  mother id.  So the id block encodes the SIMULATION INSTANCE (in-time vs
+  out-of-time), NOT the generator — an in-time cosmic lands in the 1e7
+  block next to the GENIE tracks; use the MCTruth Assns for provenance.
+- A primary's `Mother()` is therefore the offset root (e.g. 10000000),
+  NOT 0 — the larreco CellTree `Mother()==0` primary test finds nothing.
+  Use `Process()=="primary"` (keep `Mother()==0` as a legacy OR).
 - "Beam neutrino derived" = the largeant `MCParticle<->MCTruth` Assns
   MCTruth has `Origin()==simb::kBeamNeutrino` (CellTree "nuOnly").
   Do NOT compare the assns product id to the generator handle: rockbox
