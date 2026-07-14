@@ -1,3 +1,12 @@
+// FilterEventID: keep only events whose (run, event) match a supplied list.
+//
+// Original author: Lynn Tung.  Copied verbatim from her sbndcode module
+//   sbndcode/Commissioning/FilterEventID_module.cc
+// on branch feature/lynnt_evtfilter:
+//   https://github.com/SBNSoftware/sbndcode/blob/feature/lynnt_evtfilter/sbndcode/Commissioning/FilterEventID_module.cc
+// Ported into larwirecell so the event-ID filter runs without depending on the
+// sbndcode feature branch.  All credit for the logic goes to Lynn Tung.
+
 // #include <iostream>
 // #include <stdlib.h>
 // #include <string>
