@@ -15,6 +15,12 @@ cet_build_plugin(WireCellToolkit art::SharedProducer
   art::Utilities
   )
 
+cet_build_plugin(FilterEventID art::EDFilter
+  LIBRARIES PRIVATE
+  canvas::canvas
+  fhiclcpp::fhiclcpp
+  )
+
 add_subdirectory(Geometry)
 
 install_headers()
