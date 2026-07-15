@@ -8,9 +8,18 @@
  * Event level labels (added to the output ITensorSet metadata, following the
  * "frame_apply_at_caf" convention of OpFlashSource):
  *   - runNo/subRunNo/eventNo: art run/subrun/event numbers.
- *   - nu_pdg, nu_ccnc, nu_int_type, nu_energy (GeV), nu_vtx_{x,y,z} (cm),
- *     nu_flavor ("nue"/"numu"/"nc"/"none"): from the generator MCTruth
- *     (cf. Ningclover larwirecell/aiml/Truth2h5.cxx).
+ *   - n_nu: number of beam-neutrino interactions in the event.
+ *   - nu_idx, nu_pdg, nu_ccnc, nu_int_type, nu_energy (GeV),
+ *     nu_vtx_{x,y,z} (cm), nu_flavor ("nue"/"numu"/"nc"/"none"), nu_edep
+ *     (GeV): PARALLEL ARRAYS of length n_nu, one entry per interaction
+ *     (rockbox events carry several beam-nu interactions -- in-detector
+ *     plus dirt/rock).  Entry 0 is the "main" interaction.  nu_idx is the
+ *     generator-MCTruth index (matches the truth_per_track "nu_idx" column
+ *     and the mc-tree node id 9000000+nu_idx).  nu_* are from the generator
+ *     MCTruth (cf. Ningclover larwirecell/aiml/Truth2h5.cxx).  nu_edep is
+ *     the DEPOSITED (visible) energy of the interaction: sum of
+ *     sim::SimEnergyDeposit::Energy() over deposits whose (abs) trackid
+ *     descends from it -- well below nu_energy.
  *
  * Track level truth: a new 2D "truth_per_track" tensor, one row per
  * simb::MCParticle (cf. Ningclover TrackIDPIDMap2h5.cxx).  Columns are listed
@@ -95,8 +104,9 @@
  *     cluster ids).  Interaction-level particles are GROUPED under a
  *     per-interaction "initial mother neutrino" node built from the
  *     generator MCTruth (id = 9000000 + nu_idx; start = end = the
- *     interaction vertex; name/KE from the MCTruth neutrino) -- rockbox
- *     events carry several beam-nu interactions per event.
+ *     interaction vertex; name from the MCTruth neutrino, energy = the
+ *     interaction's DEPOSITED energy Edep [MeV], not the neutrino total
+ *     energy) -- rockbox events carry several beam-nu interactions/event.
  */
 
 #ifndef LARWIRECELL_AIML_TENSORSETLABELER
@@ -215,6 +225,7 @@ namespace WireCell::AIML {
     std::vector<std::vector<double>> m_tracks; // truth_per_track rows
     std::vector<Depo> m_depos;
     std::map<int, int> m_michel_mother;      // Michel e- trackid -> mother muon trackid
+    std::map<int, double> m_nu_edep;         // nu_idx -> sum SED Energy() [MeV] of that interaction
     WireCell::Configuration m_pf_particles;  // Bee "mc" jstree node array
 
     size_t m_count{0};

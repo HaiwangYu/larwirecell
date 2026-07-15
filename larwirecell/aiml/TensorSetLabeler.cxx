@@ -324,32 +324,52 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
   m_tracks.clear();
   m_depos.clear();
   m_michel_mother.clear();
+  m_nu_edep.clear();
 
   // --- neutrino truth (cf. Truth2h5) ---
-  m_evtmd["nu_flavor"] = "none";
+  // An event can carry SEVERAL beam-neutrino interactions (rockbox: the
+  // in-detector interaction plus dirt/rock ones), so every nu_* field is an
+  // ARRAY with one entry per interaction; "n_nu" is the count and "nu_idx"
+  // gives each entry's generator-MCTruth index (matches the truth_per_track
+  // "nu_idx" column, the mc-tree node id offset 9000000+nu_idx, and the
+  // m_nu_edep keys).  Entry 0 is the "main" interaction.  nu_edep is filled
+  // in the Edep pass below (deposits are read after the MCParticles).
+  for (const char* f : {"nu_idx", "nu_pdg", "nu_ccnc", "nu_int_type",
+                        "nu_energy", "nu_vtx_x", "nu_vtx_y", "nu_vtx_z",
+                        "nu_flavor"}) {
+    m_evtmd[f] = Json::arrayValue;
+  }
+  m_evtmd["n_nu"] = 0;
   art::Handle<std::vector<simb::MCTruth>> mctruth_handle;
   if (event.getByLabel(art::InputTag{m_mctruth_label}, mctruth_handle) &&
-      mctruth_handle.isValid() && !mctruth_handle->empty() &&
-      mctruth_handle->front().NeutrinoSet()) {
-    const auto& nu = mctruth_handle->front().GetNeutrino();
-    const auto& nu_particle = nu.Nu();
-    const auto& position = nu_particle.Position(0);
-    const auto& momentum = nu_particle.Momentum(0);
-    const int pdg = nu_particle.PdgCode();
-    const int ccnc = nu.CCNC(); // 0 = CC, 1 = NC
-    m_evtmd["nu_pdg"] = pdg;
-    m_evtmd["nu_ccnc"] = ccnc;
-    m_evtmd["nu_int_type"] = nu.InteractionType();
-    m_evtmd["nu_energy"] = momentum.E();   // GeV
-    m_evtmd["nu_vtx_x"] = position.X();    // cm
-    m_evtmd["nu_vtx_y"] = position.Y();
-    m_evtmd["nu_vtx_z"] = position.Z();
-    if (ccnc == 1) { m_evtmd["nu_flavor"] = "nc"; }
-    else if (std::abs(pdg) == 12) { m_evtmd["nu_flavor"] = "nue"; }
-    else if (std::abs(pdg) == 14) { m_evtmd["nu_flavor"] = "numu"; }
-    else if (std::abs(pdg) == 16) { m_evtmd["nu_flavor"] = "nutau"; }
+      mctruth_handle.isValid()) {
+    for (size_t i = 0; i < mctruth_handle->size(); ++i) {
+      const auto& mct = (*mctruth_handle)[i];
+      if (!mct.NeutrinoSet()) { continue; }
+      const auto& nu = mct.GetNeutrino();
+      const auto& nu_particle = nu.Nu();
+      const auto& position = nu_particle.Position(0);
+      const auto& momentum = nu_particle.Momentum(0);
+      const int pdg = nu_particle.PdgCode();
+      const int ccnc = nu.CCNC(); // 0 = CC, 1 = NC
+      std::string flavor = "none";
+      if (ccnc == 1) { flavor = "nc"; }
+      else if (std::abs(pdg) == 12) { flavor = "nue"; }
+      else if (std::abs(pdg) == 14) { flavor = "numu"; }
+      else if (std::abs(pdg) == 16) { flavor = "nutau"; }
+      m_evtmd["nu_idx"].append((int)i);
+      m_evtmd["nu_pdg"].append(pdg);
+      m_evtmd["nu_ccnc"].append(ccnc);
+      m_evtmd["nu_int_type"].append(nu.InteractionType());
+      m_evtmd["nu_energy"].append(momentum.E()); // GeV
+      m_evtmd["nu_vtx_x"].append(position.X());   // cm
+      m_evtmd["nu_vtx_y"].append(position.Y());
+      m_evtmd["nu_vtx_z"].append(position.Z());
+      m_evtmd["nu_flavor"].append(flavor);
+    }
+    m_evtmd["n_nu"] = (int)m_evtmd["nu_idx"].size();
   }
-  else {
+  if (m_evtmd["n_nu"].asInt() == 0) {
     log->debug("no neutrino MCTruth at '{}' for run {} sub {} evt {}",
                m_mctruth_label, m_run, m_sub, m_evt);
   }
@@ -441,6 +461,30 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
     log->warn("failed to fetch MCParticles with label '{}'", m_mcparticle_label);
   }
 
+  // --- neutrino deposited energy (Edep): sum sim::SimEnergyDeposit::Energy()
+  // over deposits whose (abs) trackid belongs to a beam-neutrino
+  // interaction, accumulated per interaction (nu_idx).  This is the visible
+  // (reconstructable) energy -- used for the event metadata and, in the
+  // Bee "mc" tree, as the mother-neutrino node energy (not the nu total E).
+  {
+    art::Handle<std::vector<sim::SimEnergyDeposit>> edep_seds;
+    if (event.getByLabel(art::InputTag{m_deposet_label}, edep_seds) && edep_seds.isValid()) {
+      for (const auto& sed : *edep_seds) {
+        const auto iit = tid2idx.find(std::abs(sed.TrackID()));
+        if (iit == tid2idx.end() || iit->second >= nu_index.size()) { continue; }
+        const int nidx = nu_index[iit->second];
+        if (nidx >= 0) { m_nu_edep[nidx] += sed.Energy(); } // MeV
+      }
+    }
+    // Per-interaction Edep into the event metadata, GeV to parallel
+    // nu_energy, aligned entry-by-entry with the nu_idx array.
+    m_evtmd["nu_edep"] = Json::arrayValue;
+    for (const auto& jidx : m_evtmd["nu_idx"]) {
+      const int k = jidx.asInt();
+      m_evtmd["nu_edep"].append((m_nu_edep.count(k) ? m_nu_edep.at(k) : 0.0) * 1e-3);
+    }
+  }
+
   // --- Bee "mc" particle-flow tree: MCParticles with KE > pf_ke_min,
   // nested under the nearest KEPT ancestor by Mother() tracing.  Particles
   // are GROUPED under a per-interaction "initial mother neutrino" node
@@ -449,7 +493,7 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
   struct NuNode {
     bool valid{false};
     int pdg{0};
-    double ke_mev{0}, vx{0}, vy{0}, vz{0};
+    double vx{0}, vy{0}, vz{0};
   };
   std::vector<NuNode> nutruths;
   if (mctruth_handle.isValid()) {
@@ -459,7 +503,6 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
         const auto& nu_p = mct.GetNeutrino().Nu();
         nn.valid = true;
         nn.pdg = nu_p.PdgCode();
-        nn.ke_mev = (nu_p.Momentum(0).E() - nu_p.Mass()) * 1e3;
         const auto& pos = nu_p.Position(0);
         nn.vx = pos.X();
         nn.vy = pos.Y();
@@ -566,8 +609,11 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       char text[64];
       if (nidx < (int)nutruths.size() && nutruths[nidx].valid) {
         const auto& nn = nutruths[nidx];
-        std::snprintf(text, sizeof(text), "%s  %.1f MeV",
-                      pdg_name(nn.pdg).c_str(), nn.ke_mev);
+        // node energy = the interaction's DEPOSITED energy (MeV), not the
+        // neutrino total energy.
+        const double edep_mev = m_nu_edep.count(nidx) ? m_nu_edep.at(nidx) : 0.0;
+        std::snprintf(text, sizeof(text), "%s  Edep %.1f MeV",
+                      pdg_name(nn.pdg).c_str(), edep_mev);
         Configuration dj;
         dj["start"][0] = nn.vx; // cm, as Bee wants
         dj["start"][1] = nn.vy;
@@ -631,10 +677,15 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
     log->warn("failed to fetch SimEnergyDeposits with label '{}'", m_deposet_label);
   }
 
-  log->debug("visit run {} sub {} evt {}: nu_flavor {}, {} tracks, {} depos, "
+  const std::string flav0 =
+    m_evtmd["nu_flavor"].size() ? m_evtmd["nu_flavor"][0u].asString() : "none";
+  log->debug("visit run {} sub {} evt {}: n_nu {}, main flavor {}, "
+             "main nu_edep {:.1f} MeV, {} tracks, {} depos, "
              "{} Michel e- (Bee merge to mother muon: {})",
              m_run, m_sub, m_evt,
-             m_evtmd["nu_flavor"].asString(),
+             m_evtmd["n_nu"].asInt(),
+             flav0,
+             m_nu_edep.count(0) ? m_nu_edep.at(0) : 0.0,
              m_tracks.size(),
              m_depos.size(),
              m_michel_mother.size(),

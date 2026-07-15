@@ -14,12 +14,21 @@ between the all-APA MultiAlgBlobClustering and its TensorFileSink and
 attaches truth to the clustering ITensorSet (a serialized PointCloud tree):
 
 - **Event metadata**: `runNo/subRunNo/eventNo` + generator-MCTruth neutrino
-  info (`nu_pdg/nu_ccnc/nu_int_type/nu_energy/nu_vtx_{x,y,z}/nu_flavor`)
-  added to the tensor-set metadata.
-- **`truth_per_track` tensor** `[ntracks x 22]` (columns in the tensor
+  info added to the tensor-set metadata.  Because an event can hold several
+  beam-nu interactions (rockbox), the neutrino fields are PARALLEL ARRAYS
+  of length `n_nu`, one entry per interaction:
+  `nu_idx/nu_pdg/nu_ccnc/nu_int_type/nu_energy/nu_vtx_{x,y,z}/nu_flavor/nu_edep`.
+  Entry 0 is the "main" interaction; `nu_idx[k]` is the generator-MCTruth
+  index (matches the `truth_per_track` nu_idx column and the mc-tree node id
+  `9000000+nu_idx`).  `nu_edep` (GeV) is the DEPOSITED (visible) energy of
+  the interaction — sum of `SimEnergyDeposit::Energy()` over deposits whose
+  (abs) trackid descends from it, well below `nu_energy` (see 2.10).
+- **`truth_per_track` tensor** `[ntracks x 23]` (columns in the tensor
   metadata; cm/ns/GeV): with `truth_tracks_nu_only` (default true) only
   BEAM-neutrino primaries (larreco CellTree "nuOnly" cut), all beam-nu
   interactions of the event kept and distinguished by the `nu_idx` column.
+  The `process` column is the G4 creation-process code (CellTree
+  convention; `Michel`=10001 synthetic, see 2.10).
 - **Per-blob `trackid`** written into each live blob `scalar` PC (-1 = no
   match): BlobDepoFill-style association of `ionandscint:priorSCE`
   SimEnergyDeposits with the blob (slice tick, u/v/w wire) bounds in the
@@ -38,8 +47,15 @@ attaches truth to the clustering ITensorSet (a serialized PointCloud tree):
   under one "initial mother neutrino" root node per beam-nu interaction
   (built from the generator MCTruth since largeant does not reliably save
   the initial neutrino; id = 9000000 + nu_idx, start = end = the
-  interaction vertex, name/KE from the MCTruth neutrino) -- rockbox events
-  carry several interactions per event.
+  interaction vertex, name from the MCTruth neutrino, energy = the
+  interaction's DEPOSITED energy `Edep` [MeV], not the nu total energy) --
+  rockbox events carry several interactions per event.
+- **Michel "trackid merging"** (`bee_michel_merge`, default true): in the
+  Bee `truth_trackid_labeled` and `truth_depo_sce` sets a Michel electron's
+  cluster_id is replaced by its mother muon's trackid, so decay electrons
+  render as part of the muon.  Bee display only — the blob `scalar` PC keeps
+  the true (Michel) trackid.  The map is built over ALL largeant particles,
+  independent of `pf_nu_only` (see 2.10).
 
 **Tested** on 10 corsika+GENIE rockbox MC events (runs 32/31): blobs
 labeled per event 97/74/59/80/95/88/88/76/84/91% (points labeled higher);
@@ -163,3 +179,30 @@ also carry about half the median charge of labeled blobs).
 - TensorFileSink `dump_mode: true` DISCARDS the tensors (historical
   "trash" sink); the sbnd cfg flips it off when the labeler is in the
   pipeline so the labeled output is actually written.
+
+## 2.10 process code, Michel electrons, and Edep
+
+- **`process` column**: the G4 creation-process string (`MCParticle::Process()`)
+  mapped to an int via the CellTree convention (Ningclover
+  `TrackIDPIDMap2h5.cxx`: `primary`=0, `Decay`=1, `eIoni`=2, ... `dInelastic`=33;
+  unknown → -1).  Keep the table in sync if that reference changes.
+- **Michel = synthetic code 10001** (not a G4 process): a decay electron of a
+  muon — `abs(pdg)==11` AND `Process()=="Decay"` AND `abs(mother_pdg)==13`.
+  Applied both to the `process` column and to the Bee "trackid merging".
+- **Michel merge is Bee-only and unconditional**: `bee_michel_merge` (default
+  true) rewrites the Bee cluster_id of Michel-labeled points to the mother
+  muon trackid; the blob `scalar` PC keeps the true (Michel) trackid.  The
+  Michel→mother map is built over ALL largeant particles, so it is NOT
+  filtered by `pf_nu_only` (which only prunes the mc tree).  For a COSMIC
+  Michel with `pf_nu_only:true` the mother muon has no mc-tree node either
+  way, so the merge is a pure point-view grouping; for a beam-nu Michel it
+  folds the points under the muon node.
+- **Edep** (`nu_edep`): sum of `SimEnergyDeposit::Energy()` (MeV in LArSoft)
+  over deposits whose `abs(TrackID())` maps (via the MCParticle→MCTruth
+  Assns) to a beam-nu interaction, accumulated PER interaction (`nu_idx`).
+  It is computed in a dedicated pass over the SEDs placed BEFORE the mc-tree
+  build (the tree's neutrino-node energy consumes it) and AFTER the
+  MCParticle read (needs the tid→nu_idx map).  Metadata stores it in GeV
+  (parallel to `nu_energy`, per interaction); the mc tree shows it in MeV.
+  Edep ≪ `nu_energy` for NC / poorly-contained events (e.g. evt 32/10/6 NC:
+  792 MeV total, 49.8 MeV deposited).
