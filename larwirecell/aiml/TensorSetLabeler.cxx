@@ -115,6 +115,9 @@ AIML::TensorSetLabeler::TensorSetLabeler()
   , m_drift_speed(1.563 * units::mm / units::us)
   , m_time_offset(-205 * units::us)
   , m_tick(0.5 * units::us)
+  // readout window = [tick0_time, tick0_time + nticks*tick], SBND nticks=3427
+  , m_readout_tmin(-205 * units::us)
+  , m_readout_tmax(1508.5 * units::us)
   , m_DL(4.0 * units::cm * units::cm / units::s)   // wcsimsp_sbnd.fcl DL
   , m_DT(8.8 * units::cm * units::cm / units::s)   // wcsimsp_sbnd.fcl DT
   , m_sp_smear_time(1.0 / (2 * 3.141592653589793 * 0.10 * units::megahertz))
@@ -142,12 +145,17 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   // Residual shift ADDED to depo times before drift conversion (see header).
   cfg["depo_time_offset"] = m_depo_time_offset;
   cfg["tick"] = m_tick;
+  // "Readout" pseudo-sim cut: keep a depo only if its pseudo-sim time
+  // (x_app - x_W)*dirx/drift_speed (= t_sig + time_offset, the trigger-frame
+  // slice time; tick 0 at time_offset) is within this window.  SBND default
+  // [-205us, 1508.5us] = [tick0_time, tick0_time + nticks*tick] (nticks=3427).
+  cfg["readout_time_min"] = m_readout_tmin;
+  cfg["readout_time_max"] = m_readout_tmax;
   // Acceptance slop (in wires / ticks) around the blob bounds, standing in
   // for the diffusion extents BlobDepoFill integrates (point-like depos).
   cfg["wire_slop"] = m_wire_slop;
   cfg["tick_slop"] = m_tick_slop;
-  // readout length in ticks; used to clip the truth_depo_sce Bee display
-  // to the window blobs can exist in.
+  // legacy (superseded by readout_time_min/max); kept for config back-compat.
   cfg["nticks"] = m_nticks;
   // Depo diffusion (see header): drift diffusion DL/DT + SP filter smearing
   // (time sigma + per-plane-type wire sigma in pitch units); acceptance is
@@ -158,7 +166,7 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   cfg["sp_smear_wire_ind"] = m_sp_smear_wire_ind;
   cfg["sp_smear_wire_col"] = m_sp_smear_wire_col;
   cfg["nsigma"] = m_nsigma;
-  // truth_depo_sce Bee set: Gaussian samples per depo diffusion ball.
+  // SED pseudo-sim Bee sets: Gaussian samples per depo diffusion ball.
   cfg["n_sample_truth_depo_sce"] = m_nsample_depo;
   // ISCEField with the TrueFwd (true->reco) displacement map; empty = off.
   cfg["sce_field"] = "";
@@ -197,6 +205,8 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
   m_time_offset = get(cfg, "time_offset", m_time_offset);
   m_depo_time_offset = get(cfg, "depo_time_offset", m_depo_time_offset);
   m_tick = get(cfg, "tick", m_tick);
+  m_readout_tmin = get(cfg, "readout_time_min", m_readout_tmin);
+  m_readout_tmax = get(cfg, "readout_time_max", m_readout_tmax);
   m_wire_slop = get(cfg, "wire_slop", m_wire_slop);
   m_tick_slop = get(cfg, "tick_slop", m_tick_slop);
   m_nticks = get(cfg, "nticks", m_nticks);
@@ -298,6 +308,9 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
              m_time_offset / units::us,
              m_depo_time_offset / units::us,
              m_tick / units::us);
+  log->debug("readout pseudo-sim-t window [{}, {}] us (tick 0 = time_offset {} us)",
+             m_readout_tmin / units::us, m_readout_tmax / units::us,
+             m_time_offset / units::us);
 }
 
 void AIML::TensorSetLabeler::finalize()
@@ -654,15 +667,18 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       // delta-ray charge dominates come out "unlabeled" (tid<0).
       d.trackid = std::abs(sed.TrackID());
       d.weight = sed.NumElectrons() > 0 ? (double)sed.NumElectrons() : sed.Energy();
+      // keep the TRUE (pre-SCE) position for the smear-only pseudo-sim set
+      d.x0 = d.x;
+      d.y0 = d.y;
+      d.z0 = d.z;
       if (do_sce) {
         // "postSCE" on the fly: shift the true position by the TrueFwd
         // (true->reco) displacement of the depo's TPC.
         for (const auto& [af, fc] : m_faces) {
-          if (d.x < fc.xmin || d.x > fc.xmax) { continue; }
-          const double x0 = d.x, y0 = d.y, z0 = d.z;
-          d.x += m_sce->displacement_x(af.first, x0, y0, z0);
-          d.y += m_sce->displacement_y(af.first, x0, y0, z0);
-          d.z += m_sce->displacement_z(af.first, x0, y0, z0);
+          if (d.x0 < fc.xmin || d.x0 > fc.xmax) { continue; }
+          d.x += m_sce->displacement_x(af.first, d.x0, d.y0, d.z0);
+          d.y += m_sce->displacement_y(af.first, d.x0, d.y0, d.z0);
+          d.z += m_sce->displacement_z(af.first, d.x0, d.y0, d.z0);
           ++nsce;
           break;
         }
@@ -749,12 +765,42 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     }
     return t;
   };
+  // Two SED pseudo-sim clouds (see PSEUDO-SIM in the header):
+  //   sed-sce_drift_smear_readout: all 4 effects (overlays the blobs),
+  //   sed-smear_readout: smear + readout only, at the TRUE position.
   Bee::Points bpts_depo(m_bee_detector, m_bee_depo_algorithm);
   bpts_depo.rse(m_run, m_sub, m_evt);
-  const bool dump_depo = m_bee_sink && m_sce && m_sce_correction;
+  Bee::Points bpts_sr(m_bee_detector, m_bee_sr_algorithm);
+  bpts_sr.rse(m_run, m_sub, m_evt);
+  const bool dump_sdsr = m_bee_sink && m_sce && m_sce_correction; // needs SCE chain
+  const bool dump_sr = (bool)m_bee_sink;                          // any run
   const int nsample = std::max(1, m_nsample_depo);
   std::normal_distribution<double> gaus(0.0, 1.0);
   double max_stick = 0; // widest depo time-sigma, sets the blob tick window
+  // Ball sampler: apply the "readout" cut on the pseudo-sim time
+  //   pseudo_t = (x_app - x_W)*dirx/drift_speed  (= t_sig + time_offset)
+  // then Gaussian-sample the diffusion+SP ball (sigma from x_drift's drift
+  // distance) into the given Bee set.  q split evenly across samples.
+  auto dump_ball = [&](Bee::Points& bp, const FaceCtx& fc, double x_app,
+                       double yv, double zv, double x_drift, int trackid, double weight) {
+    const double pseudo_t = (x_app - fc.xw) * fc.dirx / m_drift_speed;
+    if (pseudo_t < m_readout_tmin || pseudo_t > m_readout_tmax) { return; } // readout cut
+    const double t_drift = std::max(0.0, (x_drift - fc.xw) * fc.dirx / m_drift_speed);
+    const double sigL = std::sqrt(2 * m_DL * t_drift);
+    const double sigT = std::sqrt(2 * m_DT * t_drift);
+    const double sig_time = std::sqrt(sigL / m_drift_speed * (sigL / m_drift_speed) +
+                                      m_sp_smear_time * m_sp_smear_time);
+    const double sig_x = sig_time * m_drift_speed;
+    const double spw = m_sp_smear_wire_ind * fc.pitch[0]; // U-plane transverse
+    const double sig_yz = std::sqrt(sigT * sigT + spw * spw);
+    const int cid = bee_cid(trackid);
+    for (int k = 0; k < nsample; ++k) {
+      bp.append(Point(x_app + gaus(m_rng) * sig_x,
+                      yv + gaus(m_rng) * sig_yz,
+                      zv + gaus(m_rng) * sig_yz),
+                weight / nsample, cid, cid);
+    }
+  };
   for (const auto& d : m_depos) {
     const double tdep = d.t + m_depo_time_offset;
     for (const auto& [af, fc] : m_faces) {
@@ -781,21 +827,15 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
         }
         max_stick = std::max(max_stick, pd.stick);
       }
-      // Draw only depos whose apparent position lands inside the readout
-      // window (blobs only exist for ticks [0, nticks)); far-out-of-time
-      // depos (e.g. radiologicals) would fly off to |x|~km otherwise.
-      // Sample nsample points from the diffusion ball (q split evenly);
-      // the transverse display sigma uses the U-plane (largest) value.
-      if (dump_depo && itick >= -m_tick_slop && itick < m_nticks + m_tick_slop) {
-        const double sig_x = pd.stick * m_tick * m_drift_speed;
-        const double sig_yz = pd.swire[0] * fc.pitch[0];
-        const int cid = bee_cid(d.trackid);
-        for (int k = 0; k < nsample; ++k) {
-          bpts_depo.append(Point(x_app + gaus(m_rng) * sig_x,
-                                 d.y + gaus(m_rng) * sig_yz,
-                                 d.z + gaus(m_rng) * sig_yz),
-                           d.weight / nsample, cid, cid);
-        }
+      // "readout" pseudo-sim: keep only depos whose pseudo-sim time is in the
+      // window (far-out-of-time depos otherwise fly off to |x|~km).
+      //   set 1 (SCE+drift+smear+readout): apparent x_app at the post-SCE y,z,
+      //   set 2 (smear+readout): the TRUE position, no SCE, no drift shift.
+      if (dump_sdsr) {
+        dump_ball(bpts_depo, fc, x_app, d.y, d.z, d.x, d.trackid, d.weight);
+      }
+      if (dump_sr) {
+        dump_ball(bpts_sr, fc, d.x0, d.y0, d.z0, d.x0, d.trackid, d.weight);
       }
       const Point pos(d.x, d.y, d.z);
       // Wire-in-plane indices from the face RayGrid -- the same coordinates
@@ -964,6 +1004,9 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     m_bee_sink->write(bpts_unlab, m_bee_index, m_run, m_sub, m_evt);
     if (!bpts_depo.empty()) {
       m_bee_sink->write(bpts_depo, m_bee_index, m_run, m_sub, m_evt);
+    }
+    if (!bpts_sr.empty()) {
+      m_bee_sink->write(bpts_sr, m_bee_index, m_run, m_sub, m_evt);
     }
     if (!m_pf_particles.empty()) {
       Bee::ParticleTree pf(m_bee_pf_name);

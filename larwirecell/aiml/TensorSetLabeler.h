@@ -47,21 +47,35 @@
  * ancestor via abs(TrackID) so delta-ray-dominated blob sections stay
  * labeled with their parent track.
  *
- * TIME OFFSET GUIDANCE.  The raw (non-t0-corrected) blob x is defined by
- * BlobSampler::time2drift: x = x_Wplane + dirx*(t_sig + time_offset)*drift_speed
- * with SBND time_offset = -205us (= sim.tick0_time in
- * cfg/pgrapher/experiment/sbnd/params.jsonnet) and drift_speed = 1.563 mm/us.
- * The WCT sim (DepoTransform start_time = tick0_time - response_plane/speed,
- * chopped back by the Reframer) is arranged so a depo at true time t_dep=0
- * reconstructs at its true x.  Inverting for a depo at (x_true, t_dep):
- *   apparent x: x_app = x_true + dirx*drift_speed*(t_dep + depo_time_offset)
- *   signal time: t_sig = (x_app - x_Wplane)*dirx/drift_speed - time_offset
- *   slice tick:  itick = t_sig/tick   (tick = 0.5us)
- * So "time_offset" here MUST equal the BlobSampler's (-205us for SBND) and
- * "depo_time_offset" absorbs any residual sim-chain shift (default 0; only
- * needed if the detsim frame was shifted w.r.t. the g4 time origin).
- * Note we use the non-t0-corrected raw coordinates and the priorSCE
- * (true position) depos; SCE displacement (<~1cm) is well below blob size.
+ * PSEUDO-SIMULATION of the SimEnergyDeposits.  To make priorSCE (true) depos
+ * comparable to reconstructed blobs the labeler applies a chain of
+ * "pseudo-sim" effects, each optional/configurable:
+ *   1. SCE      -- shift the true position true->reco (TrueFwd map, below).
+ *   2. drift    -- apparent x from the deposit time:
+ *                    x_app = x + dirx*drift_speed*(t_dep + depo_time_offset)
+ *                  (a later deposit reconstructs deeper into the volume).
+ *   3. smear    -- each depo is a Gaussian "ball": drift diffusion (DL/DT)
+ *                  plus the SP-filter smearing (below); "ball sampling"
+ *                  draws n_sample_truth_depo_sce points from it.
+ *   4. readout  -- keep the depo only if its pseudo-sim TIME is inside the
+ *                  readout window [readout_time_min, readout_time_max].
+ *
+ * TIME CONVENTION (be careful -- consistent with Facade time2drift/drift2time
+ * and cfg/pgrapher/experiment/sbnd/{params,clus}.jsonnet).  The raw (non-t0-
+ * corrected) blob x is x = x_W + dirx*(t_sig + time_offset)*drift_speed, so
+ *   signal (slice) time: t_sig = (x_app - x_W)*dirx/drift_speed - time_offset
+ *   slice tick:          itick = t_sig/tick    (tick = 0.5us)
+ * "time_offset" MUST equal the BlobSampler's = sim.tick0_time = -205us for
+ * SBND -- the trigger-frame time that the lower edge of readout tick 0
+ * corresponds to (params.jsonnet).  Define the PSEUDO-SIM TIME (a.k.a.
+ * pseudo-sim-t) as the trigger-frame time of the slice:
+ *   pseudo_t = (x_app - x_W)*dirx/drift_speed  =  t_sig + time_offset
+ * so pseudo_t = time_offset at tick 0.  The SBND readout is nticks=3427
+ * ticks, giving the DEFAULT readout window
+ *   [time_offset, time_offset + nticks*tick] = [-205us, 1508.5us].
+ * (drift_speed = 1.563 mm/us; "depo_time_offset", default 0, absorbs any
+ * residual sim-chain shift.)  We use the non-t0-corrected raw coordinates
+ * and the priorSCE (true position) depos throughout.
  *
  * SCE CORRECTION (default on when "sce_field" is set).  The blobs are
  * reconstructed from post-SCE (spatially distorted) charge while the
@@ -79,17 +93,22 @@
  *     "bee_michel_merge" (default true) a Michel electron's cluster_id is
  *     replaced by its mother muon's trackid ("trackid merging") so decay
  *     electrons render as part of the muon -- Bee display only; the blob
- *     scalar PC keeps the true (Michel) trackid.  Also applied to
- *     "truth_depo_sce",
+ *     scalar PC keeps the true (Michel) trackid.  Also applied to the two
+ *     SED pseudo-sim sets below,
  *   - "truth_unlabeled": only the points of UNlabeled blobs (trackid<0),
  *     cluster_id = the reco cluster ident, to eyeball what fails to match,
- *   - "truth_depo_sce" (only when the SCE correction is applied): the
- *     SimEnergyDeposit points after the true->reco SCE shift, drawn at the
- *     DRIFTED apparent position that fills the blobs (x_app = x +
- *     dirx*drift_speed*t_dep at the post-SCE y,z), cluster_id = the truth
- *     trackid, q = the truth charge (NumElectrons).  Each depo is a
- *     diffusion "ball" (drift diffusion + SP filter smearing, see the
- *     header of the diffusion config block); "n_sample_truth_depo_sce"
+ *   - "sed-sce_drift_smear_readout" (only when the SCE correction is
+ *     applied): the SimEnergyDeposit pseudo-sim cloud with ALL FOUR effects
+ *     (SCE + drift + smear + readout) -- drawn at the DRIFTED apparent
+ *     position that fills the blobs (x_app at the post-SCE y,z), ball-
+ *     sampled, and cut to the readout window.  cluster_id = the truth
+ *     trackid (Michel-merged, see below), q = the truth charge; this is
+ *     the set that should overlay the reconstructed blobs,
+ *   - "sed-smear_readout": the same depos with ONLY smear + readout -- at
+ *     the TRUE position (no SCE, no drift shift), ball-sampled with the
+ *     diffusion sigma of the true drift distance, cut to the readout
+ *     window on the (undrifted) pseudo-sim time.  Comparing the two sets
+ *     visualizes the SCE + drift displacement.  "n_sample_truth_depo_sce"
  *     (default 1) points are Gaussian-sampled per ball (q split evenly),
  *   - "mc" (data/{i}/{i}-mc.json): a jstree particle-flow tree of the
  *     MCParticles with KE > "pf_ke_min" (default 10 MeV) and, when
@@ -154,10 +173,11 @@ namespace WireCell::AIML {
   private:
     // One depo, already projected into WCT units.
     struct Depo {
-      double x, y, z; // WCT length units
-      double t;       // WCT time units
+      double x, y, z;    // WCT length units, post-SCE (true->reco) if applied
+      double x0, y0, z0; // WCT length units, TRUE (pre-SCE) position
+      double t;          // WCT time units
       int trackid;
-      double weight;  // number of electrons (fallback: energy)
+      double weight;     // number of electrons (fallback: energy)
     };
 
     // Per (apa,face) geometry context for depo->(tick, wires) projection.
@@ -180,9 +200,18 @@ namespace WireCell::AIML {
     double m_time_offset;      // ADDED to signal time, as BlobSampler
     double m_depo_time_offset{0.0}; // ADDED to depo times
     double m_tick;             // sampling period
+    // "Readout" pseudo-sim cut (see PSEUDO-SIM section in the class header):
+    // keep a depo only if its pseudo-sim time
+    //   pseudo_t = (x_app - x_W)*dirx/drift_speed  ( = t_sig + time_offset )
+    // lies in [m_readout_tmin, m_readout_tmax].  This is the trigger-frame
+    // time of the readout slice; tick 0 is at time_offset = tick0_time.  The
+    // SBND default [-205us, 1508.5us] = [tick0_time, tick0_time+nticks*tick]
+    // (nticks=3427) is the full readout window.  Set in ctor (units).
+    double m_readout_tmin;     // readout window lower edge (pseudo-sim time)
+    double m_readout_tmax;     // readout window upper edge (pseudo-sim time)
     int m_wire_slop{1};        // accept depos this many wires outside blob bounds
     int m_tick_slop{2};        // accept depos this many ticks outside blob slice
-    int m_nticks{3400};        // readout ticks (clips the depo Bee display)
+    int m_nticks{3400};        // legacy (superseded by the readout_time_* cut)
     // Diffusion of the (point-like) SimEnergyDeposits before blob filling:
     // (1) drift diffusion sigma = sqrt(2*D*t_drift) with DL/DT from the
     //     detsim (sbndcode wcsimsp_sbnd.fcl), longitudinal (-> time) and
@@ -199,7 +228,7 @@ namespace WireCell::AIML {
     double m_sp_smear_wire_ind{0.26875}; // SP wire smearing, U/V [pitch units]
     double m_sp_smear_wire_col{0.07839}; // SP wire smearing, W [pitch units]
     double m_nsigma{3.0};      // Gaussian acceptance half-width
-    int m_nsample_depo{1};     // truth_depo_sce Bee: samples per depo ball
+    int m_nsample_depo{1};     // SED pseudo-sim Bee sets: samples per depo ball
     bool m_sce_correction{true};   // apply true->reco SCE shift to depos
     bool m_truth_tracks_nu_only{true}; // truth_per_track: only nu-origin particles
     bool m_pf_nu_only{true};           // "mc" tree: only beam-nu-derived particles
@@ -215,7 +244,9 @@ namespace WireCell::AIML {
     std::string m_bee_detector{"sbnd"};
     std::string m_bee_algorithm{"truth_trackid_labeled"};
     std::string m_bee_unlabeled_algorithm{"truth_unlabeled"};
-    std::string m_bee_depo_algorithm{"truth_depo_sce"};
+    // SED pseudo-sim clouds (see PSEUDO-SIM in the class header):
+    std::string m_bee_depo_algorithm{"sed-sce_drift_smear_readout"}; // all 4 effects
+    std::string m_bee_sr_algorithm{"sed-smear_readout"};             // smear + readout only
     std::string m_bee_pf_name{"mc"};
     int m_bee_index{0};
 

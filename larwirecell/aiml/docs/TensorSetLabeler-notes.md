@@ -39,9 +39,12 @@ attaches truth to the clustering ITensorSet (a serialized PointCloud tree):
   saved ancestor.
 - **Bee debug sets** into the shared mabc.zip: `truth_trackid_labeled`
   (labeled blob points, cluster_id = trackid), `truth_unlabeled`
-  (unlabeled blob points, cluster_id = reco cluster ident),
-  `truth_depo_sce` (the depo cloud at the drifted apparent positions,
-  sampled from the diffusion balls, clipped to the readout window), and a
+  (unlabeled blob points, cluster_id = reco cluster ident), two SED
+  PSEUDO-SIM clouds (see 2.2) -- `sed-sce_drift_smear_readout` (all four
+  effects SCE+drift+smear+readout, at the drifted apparent position; this
+  is the set that overlays the reconstructed blobs) and `sed-smear_readout`
+  (smear+readout only, at the TRUE position -- comparing the two shows the
+  SCE+drift displacement) -- and a
   `{i}-mc.json` jstree particle-flow tree: beam-nu-derived particles with
   KE > 10 MeV, nearest-kept-ancestor nesting, node id = trackid, GROUPED
   under one "initial mother neutrino" root node per beam-nu interaction
@@ -51,7 +54,7 @@ attaches truth to the clustering ITensorSet (a serialized PointCloud tree):
   interaction's DEPOSITED energy `Edep` [MeV], not the nu total energy) --
   rockbox events carry several interactions per event.
 - **Michel "trackid merging"** (`bee_michel_merge`, default true): in the
-  Bee `truth_trackid_labeled` and `truth_depo_sce` sets a Michel electron's
+  Bee `truth_trackid_labeled` and the two SED sets a Michel electron's
   cluster_id is replaced by its mother muon's trackid, so decay electrons
   render as part of the muon.  Bee display only — the blob `scalar` PC keeps
   the true (Michel) trackid.  The map is built over ALL largeant particles,
@@ -81,17 +84,45 @@ plainly there).  Fold them into the parent with `abs(TrackID())` before
 accumulating.  Effect was large: 4-event blob-label rates jumped
 82/53/47/68% → 97/74/59/80% and NN-trackid coherence became exactly 100%.
 
-## 2.2 Time/drift offset convention
+## 2.2 Pseudo-sim of the SEDs + the time/readout convention
 
-Raw (non-t0-corrected) blob x is defined by BlobSampler::time2drift:
-`x = x_W + dirx*(t_sig + time_offset)*drift_speed`, SBND
-`time_offset = -205us` (= `sim.tick0_time`), `drift_speed = 1.563 mm/us`,
-`tick = 0.5 us`.  The labeler MUST use the same values (threaded from the
-same jsonnet locals as the BlobSampler).  Inverse map for a depo:
-`x_app = x_true + dirx*v*t_dep`, `itick = ((x_app - x_W)*dirx/v + 205us)/tick`.
-The WCT sim (ductor `start_time = tick0_time - response_plane/v` + Reframer
-chop) makes an in-time depo reconstruct at its true x — no residual offset
-was needed (`depo_time_offset = 0`).
+The labeler turns priorSCE (true) depos into blob-comparable points via a
+chain of "pseudo-sim" effects, each configurable:
+1. **SCE** — true->reco shift (2.3).
+2. **drift** — apparent x from the deposit time:
+   `x_app = x + dirx*drift_speed*(t_dep + depo_time_offset)`.
+3. **smear** — diffusion + SP-filter Gaussian ball, "ball sampling" draws
+   `n_sample_truth_depo_sce` points (2.4).
+4. **readout** — keep the depo only if its pseudo-sim TIME is in the window
+   `[readout_time_min, readout_time_max]` (default `[-205us, 1508.5us]`).
+
+**Time convention (get this right).**  Raw (non-t0-corrected) blob x is
+`Facade::time2drift`: `x = x_W + dirx*(t_sig + time_offset)*drift_speed`,
+inverse `drift2time`: `t_sig = (x - x_W)*dirx/drift_speed - time_offset`.
+`time_offset` MUST equal the BlobSampler's = `sim.tick0_time` = **-205us**
+for SBND — the trigger-frame time that the lower edge of readout **tick 0**
+corresponds to (`params.jsonnet`; note the `clus.jsonnet` "= -tick0_time"
+comment is a sign typo, `time_offset == tick0_time`).  `drift_speed =
+1.563 mm/us`, `tick = 0.5 us`.  Define the **pseudo-sim time** as the
+trigger-frame time of the slice:
+
+```
+pseudo_t = (x_app - x_W)*dirx/drift_speed  =  t_sig + time_offset
+```
+
+so `pseudo_t = time_offset = -205us` at tick 0.  SBND reads out
+`nticks = 3427` ticks, so the default readout window
+`[time_offset, time_offset + nticks*tick] = [-205us, 1508.5us]` is the FULL
+readout window — hence the default.  The old hard `nticks` clip on the depo
+display is retired (the member is kept for config back-compat).  The two SED
+Bee sets differ only in which effects they apply: `sed-sce_drift_smear_readout`
+uses `x_app` (SCE+drift, so it can exceed +-200cm) and cuts on its drifted
+`pseudo_t`; `sed-smear_readout` uses the TRUE x (no SCE, no drift shift, so
+it stays within +-200cm and the readout cut is a near-no-op) with the
+diffusion sigma of the true drift distance.  The WCT sim (ductor
+`start_time = tick0_time - response_plane/v` + Reframer chop) makes an
+in-time depo reconstruct at its true x — no residual offset needed
+(`depo_time_offset = 0`).
 
 ## 2.3 SCE: priorSCE depos vs post-SCE blobs
 
@@ -147,10 +178,13 @@ Pimpos `region_binning()` index matches the strip convention.
 
 ## 2.7 Bee display gotchas
 
-- Draw the depo cloud at the DRIFTED apparent position (`x_app`), not the
-  true x, if it should overlay the raw-coordinate blobs.
-- CLIP to the readout window (`nticks`): far-out-of-time depos
-  (radiologicals at t up to 1e13 ns) otherwise fly to |x| ~ km.
+- Draw the `sed-sce_drift_smear_readout` cloud at the DRIFTED apparent
+  position (`x_app`), not the true x, so it overlays the raw-coordinate
+  blobs (`sed-smear_readout` deliberately uses the true x for comparison).
+- The **readout cut** (2.2) is what keeps far-out-of-time depos
+  (radiologicals at t up to 1e13 ns) from flying to |x| ~ km — cut on
+  `pseudo_t in [readout_time_min, readout_time_max]`, not a raw `nticks`
+  clip.
 - Shared `BeeSink`: every writer keeps its own per-event index starting at
   the same `initial_index` and increments once per event — all writers'
   indices stay aligned by event ordinal.
