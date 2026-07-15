@@ -20,7 +20,11 @@
  * CellTree "nuOnly" cut) -- no cosmic-muon truth.  Rockbox events can carry
  * several beam-nu interactions: primaries of ALL of them are kept and the
  * "nu_idx" column records each row's MCTruth index (0 = the interaction
- * the nu_* metadata describes; -1 = non-beam rows in the full table).
+ * the nu_* metadata describes; -1 = non-beam rows in the full table).  The
+ * "process" column is the G4 creation-process code (CellTree convention,
+ * cf. TrackIDPIDMap2h5.cxx; -1 for unknown), with a synthetic "Michel"
+ * code (10001) for a decay electron of a muon (pdg==e, process=="Decay",
+ * mother pdg==mu).
  *
  * Blob level truth: for each blob node of the "live" grouping the dominant
  * G4 track id is written into the blob "scalar" PC as "trackid" (int, -1 if
@@ -62,7 +66,12 @@
  *
  * Debug Bee output: when "bee_sink" names a Clus::IBeeSink, per event:
  *   - "truth_trackid_labeled": the "3d" points of LABELED blobs only, in
- *     raw coords with cluster_id = the blob's truth trackid,
+ *     raw coords with cluster_id = the blob's truth trackid.  With
+ *     "bee_michel_merge" (default true) a Michel electron's cluster_id is
+ *     replaced by its mother muon's trackid ("trackid merging") so decay
+ *     electrons render as part of the muon -- Bee display only; the blob
+ *     scalar PC keeps the true (Michel) trackid.  Also applied to
+ *     "truth_depo_sce",
  *   - "truth_unlabeled": only the points of UNlabeled blobs (trackid<0),
  *     cluster_id = the reco cluster ident, to eyeball what fails to match,
  *   - "truth_depo_sce" (only when the SCE correction is applied): the
@@ -184,6 +193,7 @@ namespace WireCell::AIML {
     bool m_sce_correction{true};   // apply true->reco SCE shift to depos
     bool m_truth_tracks_nu_only{true}; // truth_per_track: only nu-origin particles
     bool m_pf_nu_only{true};           // "mc" tree: only beam-nu-derived particles
+    bool m_bee_michel_merge{true};     // Bee: merge Michel e- cluster_id into mother muon
     double m_pf_ke_min;            // KE cut for the Bee "mc" particle tree
     ISCEField::pointer m_sce{nullptr}; // TrueFwd (true->reco) displacement map
     IFiducial::pointer m_pf_fiducial{nullptr}; // FV cut for the "mc" tree
@@ -204,6 +214,7 @@ namespace WireCell::AIML {
     WireCell::Configuration m_evtmd;         // nu_* metadata
     std::vector<std::vector<double>> m_tracks; // truth_per_track rows
     std::vector<Depo> m_depos;
+    std::map<int, int> m_michel_mother;      // Michel e- trackid -> mother muon trackid
     WireCell::Configuration m_pf_particles;  // Bee "mc" jstree node array
 
     size_t m_count{0};

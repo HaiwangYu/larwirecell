@@ -41,13 +41,48 @@ using WireCell::PointCloud::Array;
 using WireCell::PointCloud::Dataset;
 
 // Columns of the "truth_per_track" tensor.  Units: LArSoft native
-// (positions cm, time ns, momentum/energy GeV).
+// (positions cm, time ns, momentum/energy GeV).  "process" is the G4
+// creation-process code (see g4_process_code below).
 static const std::vector<std::string> track_columns = {
   "trackid",  "pdg",      "mother_trackid", "mother_pdg", "status",
   "start_x",  "start_y",  "start_z",        "start_t",    "start_px",
   "start_py", "start_pz", "start_E",        "end_x",      "end_y",
   "end_z",    "end_t",    "end_px",         "end_py",     "end_pz",
-  "end_E",    "nu_idx"};
+  "end_E",    "nu_idx",   "process"};
+
+// G4 creation-process name -> integer code, following the CellTree
+// convention (cf. Ningclover larwirecell/aiml/TrackIDPIDMap2h5.cxx).
+// Unknown processes map to -1.  "Michel" (10001) is not a G4 process: it
+// is a synthetic tag assigned by g4_process_code() below.
+static const std::unordered_map<std::string, int> g4_process_map = {
+  {"primary", 0},        {"Decay", 1},        {"eIoni", 2},
+  {"muIoni", 3},         {"eBrem", 4},        {"compt", 5},
+  {"phot", 6},           {"conv", 7},         {"hIoni", 8},
+  {"nCapture", 9},       {"muPairProd", 10},  {"CoulombScat", 11},
+  {"muBrems", 12},       {"LowEnConversion", 13}, {"annihil", 14},
+  {"neutronInelastic", 15}, {"hadElastic", 16},
+  {"hBertiniCaptureAtRest", 17}, {"muMinusCaptureAtRest", 18},
+  {"protonInelastic", 19}, {"pi+Inelastic", 20}, {"pi-Inelastic", 21},
+  {"PhotonInelastic", 22}, {"CHIPSNuclearCaptureAtRest", 23},
+  {"Transportation", 24}, {"kaon+Inelastic", 25}, {"kaon-Inelastic", 26},
+  {"kaon0LInelastic", 27}, {"ionInelastic", 28}, {"Scintillation", 29},
+  {"ionIoni", 30},       {"nKiller", 31},     {"StepLimiter", 32},
+  {"dInelastic", 33},    {"Michel", 10001}};
+
+// A Michel electron is an e+- created by the decay of a muon: pdg == e,
+// process == "Decay", mother pdg == mu.  Such tracks get the synthetic
+// "Michel" (10001) code; every other track maps its G4 process string.
+static const int kMichelCode = 10001;
+static bool is_michel(int pdg, const std::string& proc, int mother_pdg)
+{
+  return std::abs(pdg) == 11 && proc == "Decay" && std::abs(mother_pdg) == 13;
+}
+static int g4_process_code(int pdg, const std::string& proc, int mother_pdg)
+{
+  if (is_michel(pdg, proc, mother_pdg)) { return kMichelCode; }
+  auto it = g4_process_map.find(proc);
+  return it == g4_process_map.end() ? -1 : it->second;
+}
 
 // Human-readable particle name for the Bee "mc" tree text.
 static std::string pdg_name(int pdg)
@@ -139,6 +174,9 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   // truth_per_track: keep only particles descending from the generator
   // (neutrino) MCTruth (no cosmic-muon truth).
   cfg["truth_tracks_nu_only"] = m_truth_tracks_nu_only;
+  // Bee "trackid merging": display Michel electrons under their mother muon
+  // cluster_id (Bee only; the blob scalar PC keeps the true trackid).
+  cfg["bee_michel_merge"] = m_bee_michel_merge;
   cfg["anodes"] = Json::arrayValue;
   cfg["bee_sink"] = "";
   cfg["bee_detector"] = m_bee_detector;
@@ -173,6 +211,7 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
   m_truth_tracks_nu_only = get(cfg, "truth_tracks_nu_only", m_truth_tracks_nu_only);
   m_pf_nu_only = get(cfg, "pf_nu_only", m_pf_nu_only);
   m_pf_ke_min = get(cfg, "pf_ke_min", m_pf_ke_min);
+  m_bee_michel_merge = get(cfg, "bee_michel_merge", m_bee_michel_merge);
 
   m_anodes.clear();
   m_faces.clear();
@@ -284,6 +323,7 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
   m_evtmd = Json::objectValue;
   m_tracks.clear();
   m_depos.clear();
+  m_michel_mother.clear();
 
   // --- neutrino truth (cf. Truth2h5) ---
   m_evtmd["nu_flavor"] = "none";
@@ -327,6 +367,16 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       const auto& p = (*mcps)[i];
       tid2pdg[p.TrackId()] = p.PdgCode();
       tid2idx[p.TrackId()] = i;
+    }
+    // Michel electron -> mother muon trackid, for the optional Bee
+    // "trackid merging" (display Michel charge under its parent muon).
+    for (size_t i = 0; i < mcps->size(); ++i) {
+      const auto& p = (*mcps)[i];
+      const auto itm = tid2pdg.find(p.Mother());
+      const int mother_pdg = (itm == tid2pdg.end() ? 0 : itm->second);
+      if (is_michel(p.PdgCode(), p.Process(), mother_pdg)) {
+        m_michel_mother[p.TrackId()] = p.Mother();
+      }
     }
     // Tag particles derived from a BEAM neutrino: the largeant Assns maps
     // every stored MCParticle to its origin MCTruth; require
@@ -373,16 +423,18 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       const auto& e4 = p.EndPosition();
       const auto& em = p.EndMomentum();
       const auto itmom = tid2pdg.find(p.Mother());
+      const int mother_pdg = (itmom == tid2pdg.end() ? 0 : itmom->second);
       m_tracks.push_back({(double)p.TrackId(),
                           (double)p.PdgCode(),
                           (double)p.Mother(),
-                          (double)(itmom == tid2pdg.end() ? 0 : itmom->second),
+                          (double)mother_pdg,
                           (double)p.StatusCode(),
                           s4.X(), s4.Y(), s4.Z(), s4.T(),
                           sm.Px(), sm.Py(), sm.Pz(), sm.E(),
                           e4.X(), e4.Y(), e4.Z(), e4.T(),
                           em.Px(), em.Py(), em.Pz(), em.E(),
-                          (double)(i < nu_index.size() ? nu_index[i] : -1)});
+                          (double)(i < nu_index.size() ? nu_index[i] : -1),
+                          (double)g4_process_code(p.PdgCode(), p.Process(), mother_pdg)});
     }
   }
   else {
@@ -579,11 +631,14 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
     log->warn("failed to fetch SimEnergyDeposits with label '{}'", m_deposet_label);
   }
 
-  log->debug("visit run {} sub {} evt {}: nu_flavor {}, {} tracks, {} depos",
+  log->debug("visit run {} sub {} evt {}: nu_flavor {}, {} tracks, {} depos, "
+             "{} Michel e- (Bee merge to mother muon: {})",
              m_run, m_sub, m_evt,
              m_evtmd["nu_flavor"].asString(),
              m_tracks.size(),
-             m_depos.size());
+             m_depos.size(),
+             m_michel_mother.size(),
+             m_bee_michel_merge ? "on" : "off");
 }
 
 // format a "path/%d" style path (cf. MABC format_path, no subpath map)
@@ -632,6 +687,17 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   // SCE-shifted SimEnergyDeposit cloud, drawn at the DRIFTED (apparent)
   // position that directly fills the blobs: x_app (drift + t_dep shift) at
   // the post-SCE y,z -- overlays the raw-coordinate blob points exactly.
+  // Bee cluster_id "trackid merging": display a Michel electron's charge
+  // under its mother muon so decay electrons don't fragment the muon
+  // cluster.  Affects the Bee display only -- the blob scalar PC keeps the
+  // true (Michel) trackid.
+  auto bee_cid = [&](int t) -> int {
+    if (m_bee_michel_merge && t >= 0) {
+      auto it = m_michel_mother.find(t);
+      if (it != m_michel_mother.end()) { return it->second; }
+    }
+    return t;
+  };
   Bee::Points bpts_depo(m_bee_detector, m_bee_depo_algorithm);
   bpts_depo.rse(m_run, m_sub, m_evt);
   const bool dump_depo = m_bee_sink && m_sce && m_sce_correction;
@@ -672,11 +738,12 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       if (dump_depo && itick >= -m_tick_slop && itick < m_nticks + m_tick_slop) {
         const double sig_x = pd.stick * m_tick * m_drift_speed;
         const double sig_yz = pd.swire[0] * fc.pitch[0];
+        const int cid = bee_cid(d.trackid);
         for (int k = 0; k < nsample; ++k) {
           bpts_depo.append(Point(x_app + gaus(m_rng) * sig_x,
                                  d.y + gaus(m_rng) * sig_yz,
                                  d.z + gaus(m_rng) * sig_yz),
-                           d.weight / nsample, d.trackid, d.trackid);
+                           d.weight / nsample, cid, cid);
         }
       }
       const Point pos(d.x, d.y, d.z);
@@ -785,9 +852,10 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
           const auto z = dit->second.get("z")->elements<double>();
           const double q = scalar.get("charge")->elements<double>()[0];
           const double qpp = x.size() ? std::max(q / x.size(), 1.0) : 1.0;
+          const int cid = bee_cid(tid);
           for (size_t i = 0; i < x.size(); ++i) {
             if (tid >= 0) {
-              bpts.append(Point(x[i], y[i], z[i]), qpp, tid, tid);
+              bpts.append(Point(x[i], y[i], z[i]), qpp, cid, cid);
             }
             else {
               bpts_unlab.append(Point(x[i], y[i], z[i]), qpp, reco_clid, reco_clid);
