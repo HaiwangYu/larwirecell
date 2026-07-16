@@ -59,6 +59,13 @@ attaches truth to the clustering ITensorSet (a serialized PointCloud tree):
   render as part of the muon.  Bee display only — the blob `scalar` PC keeps
   the true (Michel) trackid.  The map is built over ALL largeant particles,
   independent of `pf_nu_only` (see 2.10).
+- **nugraph HDF5 output** (`hdf5_output`, default true; see 2.11): a THIRD
+  output besides the ITensorSet and the Bee sets -- a pynuml `H5DataModule`
+  heterogeneous graph (3D `sp`=blob nodes, 2D `u/v/y`=merged-wire-hit nodes,
+  edges), accumulated over events and written at `finalize()` to
+  `hdf5_filename` (default `nugraph.h5`).  Truth (`y_semantic`/`y_instance`)
+  comes from the exact SED->blob `trackid`, not the point-distance
+  approximation of the reference `pywcml/converter.py`.
 
 **Tested** on 10 corsika+GENIE rockbox MC events (runs 32/31): blobs
 labeled per event 97/74/59/80/95/88/88/76/84/91% (points labeled higher);
@@ -240,3 +247,63 @@ also carry about half the median charge of labeled blobs).
   (parallel to `nu_energy`, per interaction); the mc tree shows it in MeV.
   Edep ≪ `nu_energy` for NC / poorly-contained events (e.g. evt 32/10/6 NC:
   792 MeV total, 49.8 MeV deposited).
+
+## 2.11 nugraph HDF5 output (heterogeneous graph)
+
+Third output of the component (`hdf5_output`, default true), written at
+`finalize()` to `hdf5_filename` (default `nugraph.h5`) via the raw HDF5 C API
+(same idiom as `Truth2h5.cxx`; `${HDF5_LIBRARIES}` is already linked into
+`WireCellAIML`, no CMake change).  The container is a **pynuml
+`H5DataModule`**: top-level `/planes` `["u","v","y"]`, `/semantic_classes`
+`["nu","cosmic"]`, `/gen`, `/datasize` `[ntrain,nval,ntest]`,
+`/samples/{train,val,test}`, and ONE **scalar COMPOUND record per event** at
+`/dataset/<sample>` whose members' names embed a '/' (`sp/pos`,
+`u_nexus_sp/edge_index`, ...) -- HDF5 allows '/' in compound member names
+(unlike link names).  Match the example
+`/exp/sbnd/app/users/snehadri/repos/data/one_event_ncpi0_withnu.h5` field for
+field; positions are in **mm**, energies pass through.
+
+- **Nodes.** `sp` (3D = blobs): `pos[N,3]`, `features[N,6]` (charge,
+  reco_cluster_id, vtx_dist/dx/dy/dz), `y_semantic` {0 nu, 1 cosmic, -1
+  ghost}, `y_instance`=trackid (-1 ghost), `raw_vtx_dist`.  `u/v/y` (2D =
+  merged-wire hits from the grouping `ctpc_a*f*p{U,V,W}` PCs, grouped in
+  drift within `x_tolerance` then split on pitch gaps `> pitch_gap_tolerance`,
+  pywcml config 5.0/6.0 mm): `pos[M,2]`, `x[M,15]` (charge, charge_err,
+  nhits, pitch_min, pitch_max, vtx_dist/dx/dy/dz, then 6 sidecar zeros),
+  `id`, `y_semantic`, `y_instance`.  `evt/y` = event has a beam nu;
+  `metadata/run,subrun,event`.
+- **TRUTH is exact.**  `sp/y_semantic` = {nu if the blob's dominant trackid
+  is beam-nu-derived (`m_nu_trackids`, built in visit()), cosmic if labeled,
+  ghost if trackid<0}; `y_instance` = the trackid.  This is the whole point:
+  the SED->blob labeling gives exact node truth, replacing the reference
+  converter's point-distance matching.
+- **`{p}_nexus_sp` (2D-hit -> blob) edges** use the TRUE wire/slice-box
+  overlap the labeler already computes (a hit node's [wind,slice] range vs
+  the blob's per-plane `{u,v,w}_wire_index` + `slice_index` box, same
+  (apa,face)), not the reference's corner projection.
+- **`sp_nexus_sp` (blob-blob) edges -- CTPC GRAPH DOES NOT WORK ON THE
+  DESERIALIZED TREE.**  We attempt the WCT "ctpc" flavor
+  (`Cluster::find_graph("ctpc", dv, pcts)`, needs `detector_volumes` +
+  `pc_transforms` threaded from clus.jsonnet), but it throws `map::at` inside
+  `make_graph_ctpc` (and "basic" yields 0 edges) because `as_pctree()` does
+  NOT reconstruct the clustering-time internal maps (`map_mcell_*`, graph
+  cache).  So it cleanly falls back to an intra-cluster blob-center **kNN**
+  message-passing graph (`plane_knn`, default 6).  To get the real WCT graph
+  one must rebuild the clustering state in the labeler, or compute+serialize
+  the graph upstream in clustering.
+- **`{p}_plane_{p}` intra-plane edges are NOT produced** (added downstream in
+  post-processing, e.g. Delaunay).
+- **BOTH TPCs' ctpc must be merged to get 2D nodes on both APAs.**  The xin
+  chain is `premerged=true`, so `clus.jsonnet`'s `PointTreeMerging` is UNUSED
+  -- the joint QLMatching does the merge.  Add the per-anode ctpc names to
+  **`qlmatching.jsonnet matching_joint root_pcs_to_merge`** (not the
+  clus.jsonnet one), else only anode-0's `ctpc_a0f0p*` survives and 2D nodes
+  cover one TPC.  ctpc dataset names use the anode's global ident:
+  `ctpc_a{ident}f{face}p{U,V,W}` (`PointTreeBuilding::add_ctpc`).
+- **Empty-dimension guard.**  HDF5 array members need every dim >= 1: empty
+  edge sets are written as a dummy `[[0],[0]]`, an empty plane as one dummy
+  node, and events with 0 blobs are skipped.
+- **Split.**  All events -> `train` by default (`/datasize=[N,0,0]`).
+- **Validation.**  `sbnd/TensorSetLabeler/h5_sp_to_bee.py` renders the `sp`
+  nodes to a Bee zip (q: 1 nu / 0 cosmic / -1 ghost; cluster_id = trackid)
+  for BEE review; 10-event totals 1905 nu / 33036 cosmic / 7277 ghost blobs.

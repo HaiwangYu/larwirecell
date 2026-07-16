@@ -126,6 +126,39 @@
  *     interaction vertex; name from the MCTruth neutrino, energy = the
  *     interaction's DEPOSITED energy Edep [MeV], not the neutrino total
  *     energy) -- rockbox events carry several beam-nu interactions/event.
+ *
+ * HDF5 OUTPUT (nugraph, "hdf5_output" default true).  A third output (besides
+ * the ITensorSet and the Bee points): a heterogeneous graph HDF5 for nugraph
+ * training/testing, accumulated over events and written at finalize() to
+ * "hdf5_filename" as a pynuml H5DataModule container:
+ *   /planes ["u","v","y"], /semantic_classes ["nu","cosmic"], /gen, /datasize
+ *   [ntrain,nval,ntest], /samples/{train,val,test}, and one scalar COMPOUND
+ *   record per event at /dataset/<sample_name> whose slash-named fields are:
+ *   - sp (3D nodes = blobs): sp/pos [N,3] mm, sp/features [N,6]
+ *     (charge, reco_cluster_id, vtx_dist, vtx_dx, vtx_dy, vtx_dz),
+ *     sp/y_semantic {0 nu,1 cosmic,-1 ghost}, sp/y_instance = trackid (-1),
+ *     sp/raw_vtx_dist, and supervision edges sp/edge_label_index [2,E],
+ *     sp/edge_y (same-trackid), sp/edge_labelable (both non-ghost).
+ *   - u,v,y (2D nodes = per-plane merged wire measurements from the grouping
+ *     ctpc_a*f*p{U,V,W} PCs, grouped in drift then split on pitch gaps):
+ *     {p}/pos [M,2] mm, {p}/x [M,15] (charge,charge_err,nhits,pitch_min,
+ *     pitch_max, vtx_dist/dx/dy/dz, then 6 sidecar zeros), {p}/id,
+ *     {p}/y_semantic, {p}/y_instance.
+ *   - edges: sp_nexus_sp (blob-blob).  Attempts the WCT "ctpc" graph flavor
+ *     via Facade find_graph with detector_volumes + pc_transforms, but that
+ *     needs clustering-time internal maps that as_pctree() does not rebuild
+ *     (it throws map::at on the restored tree), so it falls back to an
+ *     intra-cluster blob-center kNN graph (also used if dv/pcts are unset).
+ *     And {p}_nexus_sp (2D-hit -> blob, from the
+ *     TRUE wire/slice-box overlap our labeler already uses -- not the
+ *     reference's approximate corner projection).  The intra-plane
+ *     {p}_plane_{p} edges are NOT produced here (added in post-processing).
+ *   - evt/num_nodes, evt/y (event has a beam nu), metadata/run,subrun,event.
+ * The truth (y_semantic / y_instance) comes from the exact SED->blob trackid
+ * labeling, so it is exact rather than the point-distance approximation of
+ * the reference pywcml/converter.py.  NOTE: the 2D nodes only cover anode/
+ * faces whose ctpc_* PC reaches this all-APA grouping (PointTreeMerging's
+ * root_pcs_to_merge); extend that list in clus.jsonnet to cover every TPC.
  */
 
 #ifndef LARWIRECELL_AIML_TENSORSETLABELER
@@ -133,7 +166,9 @@
 
 #include "WireCellAux/Logger.h"
 #include "WireCellClus/IBeeSink.h"
+#include "WireCellClus/IPCTransform.h"
 #include "WireCellIface/IAnodePlane.h"
+#include "WireCellIface/IDetectorVolumes.h"
 #include "WireCellIface/IFiducial.h"
 #include "WireCellIface/ISCEField.h"
 #include "WireCellIface/IConfigurable.h"
@@ -143,6 +178,7 @@
 
 #include <map>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -171,6 +207,26 @@ namespace WireCell::AIML {
     void finalize() override;
 
   private:
+    // Write the accumulated m_events to m_hdf5_filename as a pynuml
+    // H5DataModule container (called from finalize()).
+    void write_hdf5();
+
+    // One field of a per-event nugraph HDF5 compound record.  Stored as a
+    // flat buffer + dims; written as a compound member (name may contain '/',
+    // e.g. "sp/pos", "u_nexus_sp/edge_index") in finalize().
+    struct H5Member {
+      std::string name;
+      bool is_float;                       // true: float32, false: int64
+      std::vector<unsigned long long> dims; // empty = scalar
+      std::vector<float> f;
+      std::vector<long long> i;
+    };
+    // One event's heterogeneous graph, ready to serialize.
+    struct EventGraph {
+      std::string sample_name;
+      std::vector<H5Member> members;
+    };
+
     // One depo, already projected into WCT units.
     struct Depo {
       double x, y, z;    // WCT length units, post-SCE (true->reco) if applied
@@ -234,6 +290,17 @@ namespace WireCell::AIML {
     bool m_pf_nu_only{true};           // "mc" tree: only beam-nu-derived particles
     bool m_bee_michel_merge{true};     // Bee: merge Michel e- cluster_id into mother muon
     double m_pf_ke_min;            // KE cut for the Bee "mc" particle tree
+    // nugraph HDF5 output (heterogeneous graph for training/testing; see the
+    // HDF5 OUTPUT section in the class header).  Accumulated per event and
+    // written at finalize() as a pynuml H5DataModule container.
+    bool m_hdf5_output{true};      // write the nugraph .h5 (default on)
+    std::string m_hdf5_filename{"nugraph.h5"};
+    int m_plane_knn{6};            // sp-sp kNN fallback (see .cxx)
+    // detector geometry for the "ctpc" blob-blob graph flavor (sp_nexus_sp)
+    IDetectorVolumes::pointer m_dv{nullptr};
+    WireCell::Clus::IPCTransformSet::pointer m_pcts{nullptr};
+    double m_ctpc_x_tol;           // 2D-node drift grouping tol (set in ctor)
+    double m_ctpc_pitch_gap;       // 2D-node pitch-gap split tol (set in ctor)
     ISCEField::pointer m_sce{nullptr}; // TrueFwd (true->reco) displacement map
     IFiducial::pointer m_pf_fiducial{nullptr}; // FV cut for the "mc" tree
     std::vector<IAnodePlane::pointer> m_anodes;
@@ -257,7 +324,9 @@ namespace WireCell::AIML {
     std::vector<Depo> m_depos;
     std::map<int, int> m_michel_mother;      // Michel e- trackid -> mother muon trackid
     std::map<int, double> m_nu_edep;         // nu_idx -> sum SED Energy() [MeV] of that interaction
+    std::set<int> m_nu_trackids;             // beam-nu-derived trackids (>=0), for node semantics
     WireCell::Configuration m_pf_particles;  // Bee "mc" jstree node array
+    std::vector<EventGraph> m_events;        // accumulated nugraph records (written at finalize)
 
     size_t m_count{0};
     std::mt19937 m_rng{20260708}; // fixed seed: deterministic depo-ball sampling

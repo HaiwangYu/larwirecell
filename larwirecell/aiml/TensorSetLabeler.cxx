@@ -12,6 +12,8 @@
 #include "WireCellUtil/PointTree.h"
 #include "WireCellUtil/String.h"
 #include "WireCellUtil/Units.h"
+#include "WireCellClus/Facade.h"
+#include "WireCellClus/Graphs.h"
 
 #include "art/Framework/Principal/Event.h"
 #include "art/Framework/Principal/Handle.h"
@@ -21,8 +23,14 @@
 #include "nusimdata/SimulationBase/MCParticle.h"
 #include "nusimdata/SimulationBase/MCTruth.h"
 
+#include <hdf5.h>
+#include <boost/graph/adjacency_list.hpp>
+
 #include <algorithm>
+#include <climits>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <unordered_map>
 
@@ -122,6 +130,8 @@ AIML::TensorSetLabeler::TensorSetLabeler()
   , m_DT(8.8 * units::cm * units::cm / units::s)   // wcsimsp_sbnd.fcl DT
   , m_sp_smear_time(1.0 / (2 * 3.141592653589793 * 0.10 * units::megahertz))
   , m_pf_ke_min(10 * units::MeV)
+  , m_ctpc_x_tol(5.0 * units::mm)     // pywcml config x_tolerance
+  , m_ctpc_pitch_gap(6.0 * units::mm) // pywcml config pitch_gap_tolerance
     // = 1.59 us: Gaus_wide sigma = 0.10 MHz (sbnd sp-filters.jsonnet),
     // sigma_t = 1/(2*pi*f) per dunereco docs/smear-dnn-campaign.md.
     // sp_smear_wire defaults (pitch units) = 1/(2*sqrt(pi)*k) with
@@ -185,6 +195,13 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   // Bee "trackid merging": display Michel electrons under their mother muon
   // cluster_id (Bee only; the blob scalar PC keeps the true trackid).
   cfg["bee_michel_merge"] = m_bee_michel_merge;
+  // nugraph HDF5 output (see HDF5 OUTPUT in the header).
+  cfg["hdf5_output"] = m_hdf5_output;
+  cfg["hdf5_filename"] = m_hdf5_filename;
+  cfg["plane_knn"] = m_plane_knn;
+  // IDetectorVolumes + IPCTransformSet for the "ctpc" blob-blob graph flavor.
+  cfg["detector_volumes"] = "";
+  cfg["pc_transforms"] = "";
   cfg["anodes"] = Json::arrayValue;
   cfg["bee_sink"] = "";
   cfg["bee_detector"] = m_bee_detector;
@@ -222,6 +239,15 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
   m_pf_nu_only = get(cfg, "pf_nu_only", m_pf_nu_only);
   m_pf_ke_min = get(cfg, "pf_ke_min", m_pf_ke_min);
   m_bee_michel_merge = get(cfg, "bee_michel_merge", m_bee_michel_merge);
+  m_hdf5_output = get(cfg, "hdf5_output", m_hdf5_output);
+  m_hdf5_filename = get(cfg, "hdf5_filename", m_hdf5_filename);
+  m_plane_knn = get(cfg, "plane_knn", m_plane_knn);
+  {
+    const std::string dv_tn = get<std::string>(cfg, "detector_volumes", "");
+    const std::string pcts_tn = get<std::string>(cfg, "pc_transforms", "");
+    m_dv = dv_tn.empty() ? nullptr : Factory::find_tn<IDetectorVolumes>(dv_tn);
+    m_pcts = pcts_tn.empty() ? nullptr : Factory::find_tn<Clus::IPCTransformSet>(pcts_tn);
+  }
 
   m_anodes.clear();
   m_faces.clear();
@@ -315,10 +341,104 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
 
 void AIML::TensorSetLabeler::finalize()
 {
+  if (m_hdf5_output) {
+    write_hdf5();
+  }
   if (m_bee_sink) {
     m_bee_sink->release();
     m_bee_sink = nullptr;
   }
+}
+
+// Write the accumulated per-event graphs to a pynuml H5DataModule container
+// (raw HDF5 C API, cf. Truth2h5.cxx).  Each event is one SCALAR compound
+// record at /dataset/<sample_name>; every node/edge store is one compound
+// member whose name embeds a '/', which HDF5 allows for member names.
+void AIML::TensorSetLabeler::write_hdf5()
+{
+  hid_t file = H5Fcreate(m_hdf5_filename.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+  if (file < 0) {
+    log->error("nugraph: cannot create hdf5 file {}", m_hdf5_filename);
+    return;
+  }
+  hid_t vstr = H5Tcopy(H5T_C_S1);
+  H5Tset_size(vstr, H5T_VARIABLE);
+
+  auto write_strvec = [&](const char* name, const std::vector<std::string>& v) {
+    hsize_t dim = v.size();
+    hid_t sp = H5Screate_simple(1, &dim, NULL);
+    std::vector<const char*> p;
+    for (auto& s : v) { p.push_back(s.c_str()); }
+    hid_t lcpl = H5Pcreate(H5P_LINK_CREATE);
+    H5Pset_create_intermediate_group(lcpl, 1);
+    hid_t d = H5Dcreate2(file, name, vstr, sp, lcpl, H5P_DEFAULT, H5P_DEFAULT);
+    if (dim) { H5Dwrite(d, vstr, H5S_ALL, H5S_ALL, H5P_DEFAULT, p.data()); }
+    H5Dclose(d); H5Pclose(lcpl); H5Sclose(sp);
+  };
+  auto write_i64vec = [&](const char* name, const std::vector<long long>& v) {
+    hsize_t dim = v.size();
+    hid_t sp = H5Screate_simple(1, &dim, NULL);
+    hid_t d = H5Dcreate2(file, name, H5T_NATIVE_LLONG, sp, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+    if (dim) { H5Dwrite(d, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT, v.data()); }
+    H5Dclose(d); H5Sclose(sp);
+  };
+
+  // Top-level H5DataModule datasets.  All events go to the "train" split by
+  // default (datasize = [ntrain, nval, ntest]).
+  write_strvec("/planes", {"u", "v", "y"});
+  write_strvec("/semantic_classes", {"nu", "cosmic"});
+  write_i64vec("/gen", {3});
+  const long long N = (long long)m_events.size();
+  write_i64vec("/datasize", {N, 0, 0});
+  std::vector<std::string> names;
+  for (auto& ev : m_events) { names.push_back(ev.sample_name); }
+  write_strvec("/samples/train", names);
+  write_strvec("/samples/val", {});
+  write_strvec("/samples/test", {});
+
+  // One scalar compound record per event.
+  for (auto& ev : m_events) {
+    std::vector<size_t> offs;
+    size_t total = 0;
+    for (auto& m : ev.members) {
+      size_t n = 1;
+      for (auto dd : m.dims) { n *= (size_t)dd; }
+      offs.push_back(total);
+      total += n * (m.is_float ? sizeof(float) : sizeof(long long));
+    }
+    hid_t ctype = H5Tcreate(H5T_COMPOUND, total);
+    for (size_t k = 0; k < ev.members.size(); ++k) {
+      auto& m = ev.members[k];
+      hid_t base = m.is_float ? H5T_NATIVE_FLOAT : H5T_NATIVE_LLONG;
+      hid_t mt;
+      if (m.dims.empty()) {
+        mt = H5Tcopy(base);
+      }
+      else {
+        std::vector<hsize_t> ad(m.dims.begin(), m.dims.end());
+        mt = H5Tarray_create2(base, (unsigned)ad.size(), ad.data());
+      }
+      H5Tinsert(ctype, m.name.c_str(), offs[k], mt);
+      H5Tclose(mt);
+    }
+    std::vector<char> buf(total);
+    for (size_t k = 0; k < ev.members.size(); ++k) {
+      auto& m = ev.members[k];
+      if (m.is_float) { std::memcpy(buf.data() + offs[k], m.f.data(), m.f.size() * sizeof(float)); }
+      else { std::memcpy(buf.data() + offs[k], m.i.data(), m.i.size() * sizeof(long long)); }
+    }
+    hid_t sp = H5Screate(H5S_SCALAR);
+    hid_t lcpl = H5Pcreate(H5P_LINK_CREATE);
+    H5Pset_create_intermediate_group(lcpl, 1);
+    const std::string path = "/dataset/" + ev.sample_name;
+    hid_t d = H5Dcreate2(file, path.c_str(), ctype, sp, lcpl, H5P_DEFAULT, H5P_DEFAULT);
+    H5Dwrite(d, ctype, H5S_ALL, H5S_ALL, H5P_DEFAULT, buf.data());
+    H5Dclose(d); H5Pclose(lcpl); H5Sclose(sp); H5Tclose(ctype);
+  }
+
+  H5Tclose(vstr);
+  H5Fclose(file);
+  log->debug("nugraph: wrote {} with {} event record(s)", m_hdf5_filename, m_events.size());
 }
 
 // CellTree's "primary" test was Mother()==0; with the trackid-offset scheme
@@ -338,6 +458,7 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
   m_depos.clear();
   m_michel_mother.clear();
   m_nu_edep.clear();
+  m_nu_trackids.clear();
 
   // --- neutrino truth (cf. Truth2h5) ---
   // An event can carry SEVERAL beam-neutrino interactions (rockbox: the
@@ -427,6 +548,7 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
           if (mct.isNonnull() && mct->Origin() == simb::kBeamNeutrino) {
             nu_origin[i] = 1;
             nu_index[i] = (int)mct.key(); // index within the generator MCTruth vector
+            m_nu_trackids.insert((*mcps)[i].TrackId()); // for node semantic labels
             ++nnu;
             if (is_primary((*mcps)[i])) { ++nprim; }
           }
@@ -954,6 +1076,399 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
           }
         }
       }
+    }
+  }
+
+  // ===== nugraph heterogeneous-graph record for this event =====
+  // Built from the labeled grouping (trackid already in each blob scalar).
+  // Truth is EXACT (SED->blob), unlike the reference point-distance matcher.
+  if (m_hdf5_output) {
+    namespace Fac = WireCell::Clus::Facade;
+    auto* grouping = root->value.facade<Fac::Grouping>();
+    auto sc_i = [](Dataset& s, const char* k) -> long long {
+      auto a = s.get(k); return a ? (long long)a->elements<int>()[0] : 0; };
+    auto sc_d = [](Dataset& s, const char* k) -> double {
+      auto a = s.get(k); return a ? a->elements<double>()[0] : 0.0; };
+
+    // main (nu_idx 0) vertex in mm, for the vtx features
+    const bool has_nu = m_evtmd["n_nu"].asInt() > 0;
+    double vtx[3] = {0, 0, 0};
+    if (has_nu) {
+      vtx[0] = m_evtmd["nu_vtx_x"][0u].asDouble() * 10.0; // cm -> mm
+      vtx[1] = m_evtmd["nu_vtx_y"][0u].asDouble() * 10.0;
+      vtx[2] = m_evtmd["nu_vtx_z"][0u].asDouble() * 10.0;
+    }
+
+    // ---- sp (3D = blob) nodes ----
+    struct BInfo {
+      int apa, face;
+      int wmin[3], wmax[3], smin, smax;
+      long long tid;
+      int sem;
+      double vd, vdx, vdy, vdz;
+    };
+    std::vector<float> sp_pos, sp_feat, sp_rawvtx;
+    std::vector<long long> sp_sem, sp_inst;
+    std::vector<BInfo> binfo;
+    std::unordered_map<const Fac::Blob*, int> blob2idx;
+    std::vector<Fac::Cluster*> clusters;
+    int gidx = 0;
+    for (auto* cluster : grouping->children()) {
+      clusters.push_back(cluster);
+      long long reco_clid = -1;
+      {
+        auto& cpc = cluster->value().local_pcs();
+        auto it = cpc.find("cluster_scalar");
+        if (it != cpc.end()) { auto a = it->second.get("ident"); if (a) reco_clid = a->elements<int>()[0]; }
+      }
+      for (auto* blob : cluster->children()) {
+        auto& lpcs = blob->value().local_pcs();
+        auto sit = lpcs.find("scalar");
+        if (sit == lpcs.end()) { continue; }
+        Dataset& s = sit->second;
+        const long long tid = sc_i(s, "trackid");
+        const WirePlaneId wpid((int)sc_i(s, "wpid"));
+        const double cx = sc_d(s, "center_x"), cy = sc_d(s, "center_y"), cz = sc_d(s, "center_z");
+        const double q = sc_d(s, "charge");
+        int sem = tid < 0 ? -1 : (m_nu_trackids.count((int)tid) ? 0 : 1);
+        double vd = -1, vdx = 0, vdy = 0, vdz = 0;
+        if (has_nu && sem >= 0) {
+          vdx = cx / units::mm - vtx[0];
+          vdy = cy / units::mm - vtx[1];
+          vdz = cz / units::mm - vtx[2];
+          vd = std::sqrt(vdx * vdx + vdy * vdy + vdz * vdz);
+        }
+        sp_pos.push_back((float)(cx / units::mm));
+        sp_pos.push_back((float)(cy / units::mm));
+        sp_pos.push_back((float)(cz / units::mm));
+        sp_feat.push_back((float)q);
+        sp_feat.push_back((float)reco_clid);
+        sp_feat.push_back((float)vd);
+        sp_feat.push_back((float)vdx);
+        sp_feat.push_back((float)vdy);
+        sp_feat.push_back((float)vdz);
+        sp_sem.push_back(sem);
+        sp_inst.push_back(tid >= 0 ? tid : -1);
+        sp_rawvtx.push_back((float)vd);
+        BInfo bi;
+        bi.apa = wpid.apa(); bi.face = wpid.face();
+        const char* pn[3] = {"u", "v", "w"};
+        for (int ip = 0; ip < 3; ++ip) {
+          bi.wmin[ip] = (int)sc_i(s, (std::string(pn[ip]) + "_wire_index_min").c_str());
+          bi.wmax[ip] = (int)sc_i(s, (std::string(pn[ip]) + "_wire_index_max").c_str());
+        }
+        bi.smin = (int)sc_i(s, "slice_index_min");
+        bi.smax = (int)sc_i(s, "slice_index_max");
+        bi.tid = tid; bi.sem = sem; bi.vd = vd; bi.vdx = vdx; bi.vdy = vdy; bi.vdz = vdz;
+        binfo.push_back(bi);
+        blob2idx[blob] = gidx++;
+      }
+    }
+    const int Nsp = gidx;
+
+    // ---- sp<->sp (blob-blob) edges ----
+    // Preferred: the WCT "ctpc" graph flavor (Facade find_graph with detector
+    // volumes + PC transforms).  BUT this needs the clustering-time internal
+    // maps (map_mcell_*, graph cache) which as_pctree() does NOT reconstruct,
+    // so on the labeler's restored tree it throws (map::at); "basic" likewise
+    // yields no edges.  We therefore fall back to an intra-cluster blob-center
+    // kNN message-passing graph.
+    std::set<std::pair<int, int>> bbset;
+    bool ctpc_ok = m_dv && m_pcts;
+    auto knn_cluster = [&](Fac::Cluster* cluster) {
+      std::vector<int> gi;
+      for (auto* blob : cluster->children()) {
+        auto it = blob2idx.find(blob);
+        if (it != blob2idx.end()) { gi.push_back(it->second); }
+      }
+      const int M = (int)gi.size();
+      for (int a = 0; a < M; ++a) {
+        const int ia = gi[a];
+        std::vector<std::pair<double, int>> dd;
+        dd.reserve(M);
+        for (int b = 0; b < M; ++b) {
+          if (b == a) { continue; }
+          const int ib = gi[b];
+          const double dx = sp_pos[3 * ia] - sp_pos[3 * ib];
+          const double dy = sp_pos[3 * ia + 1] - sp_pos[3 * ib + 1];
+          const double dz = sp_pos[3 * ia + 2] - sp_pos[3 * ib + 2];
+          dd.push_back({dx * dx + dy * dy + dz * dz, ib});
+        }
+        const int kk = std::min(m_plane_knn, (int)dd.size());
+        std::partial_sort(dd.begin(), dd.begin() + kk, dd.end());
+        for (int k = 0; k < kk; ++k) {
+          int u = ia, v = dd[k].second;
+          if (u > v) { std::swap(u, v); }
+          bbset.insert({u, v});
+        }
+      }
+    };
+    const bool tried_ctpc = ctpc_ok;
+    if (ctpc_ok) {
+      try {
+        for (auto* cluster : clusters) {
+          if (cluster->nchildren() < 2 || cluster->npoints() < 2) { continue; }
+          const auto& g = cluster->find_graph("ctpc", m_dv, m_pcts);
+          auto ep = boost::edges(g);
+          for (auto it = ep.first; it != ep.second; ++it) {
+            const size_t p1 = boost::source(*it, g), p2 = boost::target(*it, g);
+            auto* b1 = cluster->blob_with_point(p1);
+            auto* b2 = cluster->blob_with_point(p2);
+            if (!b1 || !b2 || b1 == b2) { continue; }
+            auto i1 = blob2idx.find(b1), i2 = blob2idx.find(b2);
+            if (i1 == blob2idx.end() || i2 == blob2idx.end()) { continue; }
+            int a = i1->second, b = i2->second;
+            if (a > b) { std::swap(a, b); }
+            bbset.insert({a, b});
+          }
+        }
+      }
+      catch (const std::exception& e) {
+        log->warn("nugraph: 'ctpc' graph unavailable on the deserialized tree "
+                  "({}); using blob-center kNN for sp-sp edges", e.what());
+        ctpc_ok = false;
+        bbset.clear();
+      }
+    }
+    if (!ctpc_ok) { // dv/pcts not configured, or ctpc failed above
+      for (auto* cluster : clusters) {
+        if (cluster->nchildren() < 2) { continue; }
+        knn_cluster(cluster);
+      }
+    }
+    log->debug("nugraph: {} sp-sp edges ({})", bbset.size(),
+               (tried_ctpc && ctpc_ok) ? "ctpc flavor" : "knn fallback");
+
+    // ---- 2D (u/v/y) nodes from the grouping ctpc_a*f*p{U,V,W} PCs ----
+    struct Node2D {
+      double x, pitch;                 // pos (WCT length)
+      double tot_charge, mean_cerr;
+      int nhits, apa, face, plane;     // plane 0/1/2 = u/v/y
+      int wmin, wmax, smin, smax;
+      double pmin, pmax;               // pitch extent
+    };
+    std::vector<Node2D> nodes2d[3];    // per plane letter u,v,y
+    // plane letter -> nugraph plane index: U->0(u), V->1(v), W->2(y)
+    auto plane_of = [](char c) -> int { return c == 'U' ? 0 : c == 'V' ? 1 : c == 'W' ? 2 : -1; };
+    for (auto& kv : root->value.local_pcs()) {
+      const std::string& nm = kv.first;
+      if (nm.rfind("ctpc_", 0) != 0) { continue; }
+      const int pl = plane_of(nm.back());
+      if (pl < 0) { continue; }
+      // parse a{A}f{F}
+      int apa = 0, face = 0;
+      { auto pa = nm.find('a'); auto pf = nm.find('f');
+        if (pa != std::string::npos) { apa = std::atoi(nm.c_str() + pa + 1); }
+        if (pf != std::string::npos) { face = std::atoi(nm.c_str() + pf + 1); } }
+      Dataset& d = kv.second;
+      auto ax = d.get("x"); auto ay = d.get("y");
+      auto aq = d.get("charge"); auto ae = d.get("charge_err");
+      auto aw = d.get("wind"); auto as = d.get("slice_index");
+      if (!ax || !ay || !aq || !aw || !as) { continue; }
+      const auto vx = ax->elements<double>();
+      const auto vy = ay->elements<double>();
+      const auto vq = aq->elements<double>();
+      std::vector<double> ve;
+      if (ae) { auto es = ae->elements<double>(); ve.assign(es.begin(), es.end()); }
+      else { ve.assign(vx.size(), 0.0); }
+      const auto vw = aw->elements<int>();
+      const auto vs = as->elements<int>();
+      const size_t nh = vx.size();
+      if (!nh) { continue; }
+      // sort hit indices by x
+      std::vector<size_t> ord(nh);
+      for (size_t i = 0; i < nh; ++i) { ord[i] = i; }
+      std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return vx[a] < vx[b]; });
+      // greedy x-groups (running-mean reference, tol m_ctpc_x_tol), then split
+      // each group on pitch gaps > m_ctpc_pitch_gap into contiguous runs.
+      size_t i0 = 0;
+      while (i0 < nh) {
+        double xsum = 0; size_t i1 = i0;
+        while (i1 < nh) {
+          const double xi = vx[ord[i1]];
+          if (i1 > i0 && std::abs(xi - xsum / (i1 - i0)) > m_ctpc_x_tol) { break; }
+          xsum += xi; ++i1;
+        }
+        // hits [i0,i1) form an x-group; sort by pitch
+        std::vector<size_t> grp(ord.begin() + i0, ord.begin() + i1);
+        std::sort(grp.begin(), grp.end(), [&](size_t a, size_t b) { return vy[a] < vy[b]; });
+        size_t j0 = 0;
+        while (j0 < grp.size()) {
+          size_t j1 = j0 + 1;
+          while (j1 < grp.size() && (vy[grp[j1]] - vy[grp[j1 - 1]]) <= m_ctpc_pitch_gap) { ++j1; }
+          // run [j0,j1) -> one 2D node
+          Node2D n;
+          n.apa = apa; n.face = face; n.plane = pl;
+          n.nhits = (int)(j1 - j0);
+          double qsum = 0, xw = 0, pw = 0, esum = 0;
+          n.wmin = INT_MAX; n.wmax = INT_MIN; n.smin = INT_MAX; n.smax = INT_MIN;
+          n.pmin = 1e30; n.pmax = -1e30;
+          for (size_t j = j0; j < j1; ++j) {
+            const size_t h = grp[j];
+            const double qq = std::max(vq[h], 0.0);
+            qsum += vq[h]; esum += ve[h];
+            xw += vx[h] * (qq + 1e-9); pw += vy[h] * (qq + 1e-9);
+            n.wmin = std::min(n.wmin, vw[h]); n.wmax = std::max(n.wmax, vw[h]);
+            n.smin = std::min(n.smin, vs[h]); n.smax = std::max(n.smax, vs[h]);
+            n.pmin = std::min(n.pmin, vy[h]); n.pmax = std::max(n.pmax, vy[h]);
+          }
+          double wsum = 0;
+          for (size_t j = j0; j < j1; ++j) { wsum += std::max(vq[grp[j]], 0.0) + 1e-9; }
+          n.x = xw / wsum; n.pitch = pw / wsum;
+          n.tot_charge = qsum; n.mean_cerr = n.nhits ? esum / n.nhits : 0.0;
+          nodes2d[pl].push_back(n);
+          j0 = j1;
+        }
+        i0 = i1;
+      }
+    }
+
+    // ---- {p}_nexus_sp edges (2D hit -> blob) from the TRUE wire/slice box
+    // overlap; {p}/y_semantic,y_instance from linked blobs; vtx features. ----
+    const char* plane_names[3] = {"u", "v", "y"};
+    std::vector<int> nx_src[3], nx_dst[3];        // per plane: hit idx, sp idx
+    std::vector<long long> n2_sem[3], n2_inst[3];
+    std::vector<float> n2_vtx[3];                 // 4 vtx feats per node, flat
+    for (int pl = 0; pl < 3; ++pl) {
+      const int wp = pl; // plane letter index into blob wmin/wmax (u,v,w)
+      for (size_t ni = 0; ni < nodes2d[pl].size(); ++ni) {
+        const Node2D& n = nodes2d[pl][ni];
+        std::unordered_map<long long, int> inst_votes;
+        int any_nu = 0, any_cos = 0;
+        double svd = 0, svx = 0, svy = 0, svz = 0; int nvtx = 0;
+        for (int bi = 0; bi < Nsp; ++bi) {
+          const BInfo& b = binfo[bi];
+          if (b.apa != n.apa || b.face != n.face) { continue; }
+          const bool wover = b.wmin[wp] < n.wmax + 1 && n.wmin < b.wmax[wp];
+          const bool sover = b.smin < n.smax + 1 && n.smin < b.smax;
+          if (!(wover && sover)) { continue; }
+          nx_src[pl].push_back((int)ni);
+          nx_dst[pl].push_back(bi);
+          if (b.sem == 0) { ++any_nu; } else if (b.sem == 1) { ++any_cos; }
+          if (b.tid >= 0) { inst_votes[b.tid]++; }
+          svd += b.vd; svx += b.vdx; svy += b.vdy; svz += b.vdz; ++nvtx;
+        }
+        n2_sem[pl].push_back(any_nu ? 0 : (any_cos ? 1 : -1));
+        long long best = -1; int bestv = 0;
+        for (auto& kv : inst_votes) { if (kv.second > bestv) { bestv = kv.second; best = kv.first; } }
+        n2_inst[pl].push_back(best);
+        if (nvtx) { n2_vtx[pl].push_back((float)(svd / nvtx)); n2_vtx[pl].push_back((float)(svx / nvtx));
+                    n2_vtx[pl].push_back((float)(svy / nvtx)); n2_vtx[pl].push_back((float)(svz / nvtx)); }
+        else { n2_vtx[pl].push_back(-1); n2_vtx[pl].push_back(0); n2_vtx[pl].push_back(0); n2_vtx[pl].push_back(0); }
+      }
+    }
+
+    // NOTE: intra-plane {p}_plane_{p} edges are intentionally NOT produced
+    // here -- they are added downstream in post-processing (e.g. Delaunay).
+
+    // ---- assemble the compound record members ----
+    // Skip empty events (HDF5 array members need every dim >= 1).
+    if (Nsp > 0) {
+      EventGraph ev;
+      char sn[128];
+      std::snprintf(sn, sizeof(sn), "%d_%d_%d__rec-lab-apa0-1", m_run, m_sub, m_evt);
+      ev.sample_name = sn;
+      auto addF = [&](const std::string& name, std::vector<float>&& v,
+                      std::vector<unsigned long long> dims) {
+        H5Member m; m.name = name; m.is_float = true; m.dims = dims; m.f = std::move(v);
+        ev.members.push_back(std::move(m)); };
+      auto addI = [&](const std::string& name, std::vector<long long>&& v,
+                      std::vector<unsigned long long> dims) {
+        H5Member m; m.name = name; m.is_float = false; m.dims = dims; m.i = std::move(v);
+        ev.members.push_back(std::move(m)); };
+      // dummy [[0],[0]] when an edge set is empty (avoids zero-dim members).
+      auto add_edges = [&](const std::string& name, std::vector<int>& s, std::vector<int>& d) {
+        std::vector<long long> flat;
+        if (s.empty()) { flat = {0, 0}; addI(name, std::move(flat), {2, 1}); return; }
+        flat.reserve(2 * s.size());
+        for (int v : s) { flat.push_back(v); }
+        for (int v : d) { flat.push_back(v); }
+        addI(name, std::move(flat), {2, (unsigned long long)s.size()});
+      };
+
+      // metadata / evt
+      addI("metadata/run", {m_run}, {});
+      addI("metadata/subrun", {m_sub}, {});
+      addI("metadata/event", {m_evt}, {});
+      addI("evt/num_nodes", {1}, {});
+      addI("evt/y", {has_nu ? 1LL : 0LL}, {1});
+
+      // sp nodes
+      addF("sp/pos", std::move(sp_pos), {(unsigned long long)Nsp, 3});
+      addF("sp/features", std::move(sp_feat), {(unsigned long long)Nsp, 6});
+      addF("sp/raw_vtx_dist", std::move(sp_rawvtx), {(unsigned long long)Nsp});
+      addI("sp/y_semantic", std::move(sp_sem), {(unsigned long long)Nsp});
+      addI("sp/y_instance", std::move(sp_inst), {(unsigned long long)Nsp});
+
+      // sp supervision edges from the blob-blob graph, labeled by trackid.
+      {
+        std::vector<int> ss, sd; std::vector<long long> ey, elab;
+        for (auto& e : bbset) {
+          ss.push_back(e.first); sd.push_back(e.second);
+          const long long t1 = binfo[e.first].tid, t2 = binfo[e.second].tid;
+          const bool labelable = t1 >= 0 && t2 >= 0;
+          elab.push_back(labelable ? 1 : 0);
+          ey.push_back(labelable && t1 == t2 ? 1 : 0);
+        }
+        if (ss.empty()) { ss = {0}; sd = {0}; ey = {0}; elab = {0}; }
+        std::vector<int> se = ss; // for add_edges signature
+        add_edges("sp/edge_label_index", se, sd);
+        addI("sp/edge_y", std::move(ey), {(unsigned long long)ey.size()});
+        addI("sp/edge_labelable", std::move(elab), {(unsigned long long)elab.size()});
+      }
+      // sp<->sp message-passing edges (same blob-blob graph, undirected-unique)
+      {
+        std::vector<int> ms, md;
+        for (auto& e : bbset) { ms.push_back(e.first); md.push_back(e.second); }
+        add_edges("sp_nexus_sp/edge_index", ms, md);
+      }
+
+      // 2D nodes + edges per plane
+      for (int pl = 0; pl < 3; ++pl) {
+        const auto& nn = nodes2d[pl];
+        const int M = (int)nn.size();
+        std::vector<float> pos, x15; std::vector<long long> id;
+        for (int i = 0; i < M; ++i) {
+          pos.push_back((float)(nn[i].x / units::mm));
+          pos.push_back((float)(nn[i].pitch / units::mm));
+          x15.push_back((float)nn[i].tot_charge);
+          x15.push_back((float)nn[i].mean_cerr);
+          x15.push_back((float)nn[i].nhits);
+          x15.push_back((float)(nn[i].pmin / units::mm));
+          x15.push_back((float)(nn[i].pmax / units::mm));
+          x15.push_back(n2_vtx[pl][4 * i + 0]);
+          x15.push_back(n2_vtx[pl][4 * i + 1]);
+          x15.push_back(n2_vtx[pl][4 * i + 2]);
+          x15.push_back(n2_vtx[pl][4 * i + 3]);
+          for (int z = 0; z < 6; ++z) { x15.push_back(0.f); } // sidecar zeros
+          id.push_back(i);
+        }
+        const std::string p = plane_names[pl];
+        if (M > 0) {
+          addF(p + "/pos", std::move(pos), {(unsigned long long)M, 2});
+          addF(p + "/x", std::move(x15), {(unsigned long long)M, 15});
+          addI(p + "/id", std::move(id), {(unsigned long long)M});
+          addI(p + "/y_semantic", std::move(n2_sem[pl]), {(unsigned long long)M});
+          addI(p + "/y_instance", std::move(n2_inst[pl]), {(unsigned long long)M});
+        }
+        else { // rare empty plane: one dummy node so members stay non-empty
+          addF(p + "/pos", {0, 0}, {1, 2});
+          addF(p + "/x", std::vector<float>(15, 0.f), {1, 15});
+          addI(p + "/id", {0}, {1});
+          addI(p + "/y_semantic", {-1}, {1});
+          addI(p + "/y_instance", {-1}, {1});
+        }
+        add_edges(p + "_nexus_sp/edge_index", nx_src[pl], nx_dst[pl]);
+      }
+
+      m_events.push_back(std::move(ev));
+      log->debug("nugraph: {} sp, {}/{}/{} 2D (u/v/y) nodes, {} sp-sp edges",
+                 Nsp, (int)nodes2d[0].size(), (int)nodes2d[1].size(),
+                 (int)nodes2d[2].size(), (int)bbset.size());
+    }
+    else {
+      log->warn("nugraph: 0 blobs for rse=({},{},{}), skipping HDF5 record",
+                m_run, m_sub, m_evt);
     }
   }
 
