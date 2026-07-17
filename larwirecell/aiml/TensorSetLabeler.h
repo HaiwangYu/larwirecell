@@ -157,8 +157,20 @@
  * The truth (y_semantic / y_instance) comes from the exact SED->blob trackid
  * labeling, so it is exact rather than the point-distance approximation of
  * the reference pywcml/converter.py.  NOTE: the 2D nodes only cover anode/
- * faces whose ctpc_* PC reaches this all-APA grouping (PointTreeMerging's
- * root_pcs_to_merge); extend that list in clus.jsonnet to cover every TPC.
+ * faces whose ctpc_* PC reaches this all-APA grouping (the joint QLMatching's
+ * root_pcs_to_merge in the premerged xin chain); extend that list to cover
+ * every TPC.
+ *
+ * DATA MODE ("reality" = "data").  With no MC truth: visit() keeps only
+ * run/subrun/event; operator() writes ONLY the RSE into the ITensorSet
+ * metadata (empty nu_* arrays, no truth_per_track tensor), emits NO Bee sets
+ * (they are all truth-derived), and -- if hdf5_output -- writes an
+ * INPUT-ONLY HDF5 graph: the same node/edge schema with reco features
+ * (charge, reco_cluster_id, ctpc hit features, geometry edges) but the truth
+ * fields set to sentinels (y_semantic = -1, y_instance = -1, vtx_* = -1/0,
+ * edge_y/edge_labelable = 0).  Usable to run inference on real data and
+ * judge correctness by human hand-scan.  The pseudo-sim knobs are irrelevant
+ * in data mode (no depos are read).
  */
 
 #ifndef LARWIRECELL_AIML_TENSORSETLABELER
@@ -252,6 +264,12 @@ namespace WireCell::AIML {
     std::string m_deposet_label{"ionandscint:priorSCE"};
     std::string m_mctruth_label{"generator"};
     std::string m_mcparticle_label{"largeant"};
+    // "sim": full truth outputs (ITensorSet nu metadata + truth_per_track,
+    // Bee truth sets, HDF5 with truth).  "data": no truth -- only RSE in the
+    // ITensorSet metadata and (optionally) an input-only HDF5 graph (nodes +
+    // edges, truth fields set to sentinels).  The labeler's pseudo-sim knobs
+    // (sce_field/sce_correction/...) are independent of this.
+    std::string m_reality{"sim"};
     double m_drift_speed;      // set in ctor (units-dependent)
     double m_time_offset;      // ADDED to signal time, as BlobSampler
     double m_depo_time_offset{0.0}; // ADDED to depo times

@@ -149,6 +149,7 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   cfg["deposet_label"] = m_deposet_label;
   cfg["mctruth_label"] = m_mctruth_label;
   cfg["mcparticle_label"] = m_mcparticle_label;
+  cfg["reality"] = m_reality;
   // MUST match the BlobSampler configuration that made the "3d" PCs.
   cfg["drift_speed"] = m_drift_speed;
   cfg["time_offset"] = m_time_offset;
@@ -218,6 +219,7 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
   m_deposet_label = get(cfg, "deposet_label", m_deposet_label);
   m_mctruth_label = get(cfg, "mctruth_label", m_mctruth_label);
   m_mcparticle_label = get(cfg, "mcparticle_label", m_mcparticle_label);
+  m_reality = get(cfg, "reality", m_reality);
   m_drift_speed = get(cfg, "drift_speed", m_drift_speed);
   m_time_offset = get(cfg, "time_offset", m_time_offset);
   m_depo_time_offset = get(cfg, "depo_time_offset", m_depo_time_offset);
@@ -474,6 +476,17 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
     m_evtmd[f] = Json::arrayValue;
   }
   m_evtmd["n_nu"] = 0;
+
+  // DATA mode: no MC truth exists.  Keep only run/subrun/event (captured
+  // above) and the empty nu_* metadata; skip every MCTruth/MCParticle/
+  // SimEnergyDeposit read.  operator() then builds an input-only HDF5 graph
+  // (reco nodes/edges, truth fields = sentinels) and no Bee/truth_per_track.
+  if (m_reality != "sim") {
+    log->debug("visit run {} sub {} evt {}: DATA mode (RSE only, no truth)",
+               m_run, m_sub, m_evt);
+    return;
+  }
+
   art::Handle<std::vector<simb::MCTruth>> mctruth_handle;
   if (event.getByLabel(art::InputTag{m_mctruth_label}, mctruth_handle) &&
       mctruth_handle.isValid()) {
@@ -846,6 +859,10 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   }
   const int ident = in->ident();
   const std::string livepath = format_path(m_inpath, ident) + "/" + m_grouping;
+  // DATA mode: no truth.  m_depos/m_tracks/m_nu_* are empty (visit returned
+  // early), so blob trackid comes out -1, the HDF5 truth fields become
+  // sentinels, and the Bee truth sets + truth_per_track tensor are skipped.
+  const bool is_sim = (m_reality == "sim");
 
   // Deserialize the grouping point tree.
   const auto& intens = *in->tensors();
@@ -894,8 +911,8 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   bpts_depo.rse(m_run, m_sub, m_evt);
   Bee::Points bpts_sr(m_bee_detector, m_bee_sr_algorithm);
   bpts_sr.rse(m_run, m_sub, m_evt);
-  const bool dump_sdsr = m_bee_sink && m_sce && m_sce_correction; // needs SCE chain
-  const bool dump_sr = (bool)m_bee_sink;                          // any run
+  const bool dump_sdsr = is_sim && m_bee_sink && m_sce && m_sce_correction; // needs SCE chain
+  const bool dump_sr = is_sim && (bool)m_bee_sink;                          // sim only
   const int nsample = std::max(1, m_nsample_depo);
   std::normal_distribution<double> gaus(0.0, 1.0);
   double max_stick = 0; // widest depo time-sigma, sets the blob tick window
@@ -1056,8 +1073,9 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       }
       if (tid >= 0) { ++nlabeled; }
 
-      // debug Bee dump: every 3d point in raw coords, cluster_id = trackid
-      if (m_bee_sink) {
+      // debug Bee dump (sim only -- truth-derived): 3d points in raw coords,
+      // cluster_id = trackid.
+      if (is_sim && m_bee_sink) {
         auto dit = lpcs.find("3d");
         if (dit != lpcs.end() && dit->second.size_major() > 0) {
           const auto x = dit->second.get("x")->elements<double>();
@@ -1481,8 +1499,8 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     outtens.push_back(ten);
   }
 
-  // truth_per_track tensor: [ntracks x ncols] doubles.
-  {
+  // truth_per_track tensor: [ntracks x ncols] doubles (sim only).
+  if (is_sim) {
     const size_t nrows = m_tracks.size();
     const size_t ncols = track_columns.size();
     std::vector<double> flat(nrows * ncols, 0.0);
@@ -1514,7 +1532,7 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   out = std::make_shared<SimpleTensorSet>(ident, set_md,
                                           std::make_shared<ITensor::vector>(outtens));
 
-  if (m_bee_sink) {
+  if (is_sim && m_bee_sink) {
     m_bee_sink->write(bpts, m_bee_index, m_run, m_sub, m_evt);
     m_bee_sink->write(bpts_unlab, m_bee_index, m_run, m_sub, m_evt);
     if (!bpts_depo.empty()) {
