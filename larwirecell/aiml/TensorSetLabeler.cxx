@@ -642,6 +642,7 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
     bool valid{false};
     int pdg{0};
     double vx{0}, vy{0}, vz{0};
+    double etot{0}; // incoming neutrino total energy [MeV]
   };
   std::vector<NuNode> nutruths;
   if (mctruth_handle.isValid()) {
@@ -655,6 +656,7 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
         nn.vx = pos.X();
         nn.vy = pos.Y();
         nn.vz = pos.Z();
+        nn.etot = nu_p.Momentum(0).E() * 1e3; // GeV -> MeV (original total nu energy)
       }
       nutruths.push_back(nn);
     }
@@ -754,14 +756,16 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       // synthetic id: below the 1e7 GENIE trackid-offset range, unique per
       // interaction, no collision with G4 trackids.
       nu_node["id"] = 9000000 + nidx;
-      char text[64];
+      char text[96];
       if (nidx < (int)nutruths.size() && nutruths[nidx].valid) {
         const auto& nn = nutruths[nidx];
-        // node energy = the interaction's DEPOSITED energy (MeV), not the
-        // neutrino total energy.
+        // text = "<nu_idx> <flavor> Etot <total nu E> MeV Edep <deposited> MeV".
+        // nu_idx is the 1-based Bee convention (matches the sed point sets:
+        // 1,2,... per beam-nu interaction); Etot is the incoming neutrino total
+        // energy, Edep the interaction's deposited (visible) energy.
         const double edep_mev = m_nu_edep.count(nidx) ? m_nu_edep.at(nidx) : 0.0;
-        std::snprintf(text, sizeof(text), "%s  Edep %.1f MeV",
-                      pdg_name(nn.pdg).c_str(), edep_mev);
+        std::snprintf(text, sizeof(text), "%d %s Etot %.1f MeV Edep %.1f MeV",
+                      nidx + 1, pdg_name(nn.pdg).c_str(), nn.etot, edep_mev);
         Configuration dj;
         dj["start"][0] = nn.vx; // cm, as Bee wants
         dj["start"][1] = nn.vy;
@@ -802,6 +806,18 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       // delta-ray charge dominates come out "unlabeled" (tid<0).
       d.trackid = std::abs(sed.TrackID());
       d.weight = sed.NumElectrons() > 0 ? (double)sed.NumElectrons() : sed.Energy();
+      // per-point charge (q) and energy (e) carried onto the sed Bee sets.
+      d.q = (double)sed.NumElectrons();
+      d.e = sed.Energy(); // MeV
+      // neutrino-interaction index for the sed points: |trackid| -> mcps index
+      // -> beam-nu MCTruth key (0-based, -1 = not beam), remapped to the Bee
+      // convention 0 = non-neutrino activity, 1,2,... = beam-nu interactions.
+      {
+        const auto iit = tid2idx.find(d.trackid);
+        const int nidx = (iit != tid2idx.end() && iit->second < nu_index.size())
+                           ? nu_index[iit->second] : -1;
+        d.nu_idx = (nidx >= 0) ? nidx + 1 : 0;
+      }
       // keep the TRUE (pre-SCE) position for the smear-only pseudo-sim set
       d.x0 = d.x;
       d.y0 = d.y;
@@ -920,9 +936,12 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   //   pseudo_t = (x_app - x_W)*dirx/drift_speed  (= t_sig + time_offset)
   // then Gaussian-sample the diffusion+SP ball (sigma from x_drift's drift
   // distance) into the given Bee set.  q split evenly across samples.
-  auto dump_ball = [&](Bee::Points& bp, const FaceCtx& fc, double x_app,
-                       double yv, double zv, double x_drift, int trackid, double weight) {
-    const double pseudo_t = (x_app - fc.xw) * fc.dirx / m_drift_speed;
+  auto dump_ball = [&](Bee::Points& bp, const FaceCtx& fc, double x_cut,
+                       double x_point, double yv, double zv, double x_drift,
+                       int trackid, double q, double e, int nu_idx) {
+    // Readout cut on the FULL pseudo-sim (SCE+drift) apparent time (x_cut) --
+    // even for the smear-only set, whose points then sit at the TRUE x_point.
+    const double pseudo_t = (x_cut - fc.xw) * fc.dirx / m_drift_speed;
     if (pseudo_t < m_readout_tmin || pseudo_t > m_readout_tmax) { return; } // readout cut
     const double t_drift = std::max(0.0, (x_drift - fc.xw) * fc.dirx / m_drift_speed);
     const double sigL = std::sqrt(2 * m_DL * t_drift);
@@ -934,10 +953,10 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     const double sig_yz = std::sqrt(sigT * sigT + spw * spw);
     const int cid = bee_cid(trackid);
     for (int k = 0; k < nsample; ++k) {
-      bp.append(Point(x_app + gaus(m_rng) * sig_x,
+      bp.append(Point(x_point + gaus(m_rng) * sig_x,
                       yv + gaus(m_rng) * sig_yz,
                       zv + gaus(m_rng) * sig_yz),
-                weight / nsample, cid, cid);
+                q / nsample, cid, cid, e / nsample, nu_idx);
     }
   };
   for (const auto& d : m_depos) {
@@ -971,10 +990,15 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       //   set 1 (SCE+drift+smear+readout): apparent x_app at the post-SCE y,z,
       //   set 2 (smear+readout): the TRUE position, no SCE, no drift shift.
       if (dump_sdsr) {
-        dump_ball(bpts_depo, fc, x_app, d.y, d.z, d.x, d.trackid, d.weight);
+        // all 4 effects: readout cut AND point both at the SCE+drift apparent x.
+        dump_ball(bpts_depo, fc, x_app, x_app, d.y, d.z, d.x,
+                  d.trackid, d.q, d.e, d.nu_idx);
       }
       if (dump_sr) {
-        dump_ball(bpts_sr, fc, d.x0, d.y0, d.z0, d.x0, d.trackid, d.weight);
+        // smear+readout only: readout cut on the FULL pseudo-sim time (x_app),
+        // but the point stays at the TRUE (pre-SCE, pre-drift) position (x0).
+        dump_ball(bpts_sr, fc, x_app, d.x0, d.y0, d.z0, d.x0,
+                  d.trackid, d.q, d.e, d.nu_idx);
       }
       const Point pos(d.x, d.y, d.z);
       // Wire-in-plane indices from the face RayGrid -- the same coordinates

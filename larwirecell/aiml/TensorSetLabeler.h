@@ -245,7 +245,10 @@ namespace WireCell::AIML {
       double x0, y0, z0; // WCT length units, TRUE (pre-SCE) position
       double t;          // WCT time units
       int trackid;
-      double weight;     // number of electrons (fallback: energy)
+      double weight;     // number of electrons (fallback: energy) -- blob labeling
+      double q;          // sed.NumElectrons() -- per-point charge for the sed sets
+      double e;          // sed.Energy() [MeV] -- per-point energy for the sed sets
+      int nu_idx;        // 0 = non-neutrino, 1,2,... = beam-nu interaction (1-based)
     };
 
     // Per (apa,face) geometry context for depo->(tick, wires) projection.
