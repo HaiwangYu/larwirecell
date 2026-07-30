@@ -207,6 +207,9 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   cfg["bee_sink"] = "";
   cfg["bee_detector"] = m_bee_detector;
   cfg["bee_algorithm"] = m_bee_algorithm;
+  cfg["tagger_coords"] = Json::arrayValue;
+  cfg["beam_window"][0] = m_beam_window_low;
+  cfg["beam_window"][1] = m_beam_window_high;
   cfg["initial_index"] = m_bee_index;
   return cfg;
 }
@@ -220,6 +223,14 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
   m_mctruth_label = get(cfg, "mctruth_label", m_mctruth_label);
   m_mcparticle_label = get(cfg, "mcparticle_label", m_mcparticle_label);
   m_reality = get(cfg, "reality", m_reality);
+  if (cfg["tagger_coords"].isArray() && cfg["tagger_coords"].size() == 3) {
+    m_tagger_coords.clear();
+    for (const auto& c : cfg["tagger_coords"]) m_tagger_coords.push_back(c.asString());
+  }
+  if (cfg["beam_window"].isArray() && cfg["beam_window"].size() == 2) {
+    m_beam_window_low  = cfg["beam_window"][0].asDouble();
+    m_beam_window_high = cfg["beam_window"][1].asDouble();
+  }
   m_drift_speed = get(cfg, "drift_speed", m_drift_speed);
   m_time_offset = get(cfg, "time_offset", m_time_offset);
   m_depo_time_offset = get(cfg, "depo_time_offset", m_depo_time_offset);
@@ -1023,16 +1034,44 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   bpts.rse(m_run, m_sub, m_evt);
   Bee::Points bpts_unlab(m_bee_detector, m_bee_unlabeled_algorithm);
   bpts_unlab.rse(m_run, m_sub, m_evt);
+  // Cosmic/containment tagger verdicts (per-cluster flags flag_STM/flag_TGM/
+  // flag_FC, set upstream by TaggerCheckSTM/TGM/FC).  One Bee set each, same
+  // 3d points as clustering_global, cluster_id = 0 (untagged) / 1 (tagged),
+  // real_cluster_id left 0 so Bee colors by the tag.  Dumped in sim AND data.
+  Bee::Points bpts_stm(m_bee_detector, "tagger_stm"); bpts_stm.rse(m_run, m_sub, m_evt);
+  Bee::Points bpts_tgm(m_bee_detector, "tagger_tgm"); bpts_tgm.rse(m_run, m_sub, m_evt);
+  Bee::Points bpts_fc (m_bee_detector, "tagger_fc");  bpts_fc.rse(m_run, m_sub, m_evt);
 
   size_t nblobs = 0, nlabeled = 0;
   for (auto* cnode : root->children()) {
     // reco cluster ident, used as the cluster_id of the unlabeled dump
     int reco_clid = -1;
+    // Tagger Bee sets contain ONLY the clusters the taggers actually evaluate --
+    // the "beam-window candidates": Flags::main_cluster clusters (QLMatching flags
+    // the main of every matched flash bundle) whose cluster_t0 is in the beam gate
+    // [low, high).  Out-of-window mains and non-mains (associated / unmatched) are
+    // omitted entirely, so the display is just the candidates, colored by verdict:
+    //   cluster_id = 0 (not tagged) / 1 (tagged, flag_STM/TGM/FC set).
+    bool tagger_candidate = false;
+    int tag_stm = 0, tag_tgm = 0, tag_fc = 0;
     {
       auto cit = cnode->value.local_pcs().find("cluster_scalar");
       if (cit != cnode->value.local_pcs().end()) {
-        auto arr = cit->second.get("ident");
+        auto& cs = cit->second;
+        auto arr = cs.get("ident");
         if (arr) { reco_clid = arr->elements<int>()[0]; }
+        // per-cluster int flags (0 if the flag/PC is absent)
+        auto rf = [&](const char* k) -> int {
+          auto a = cs.get(k); return (a && a->size_major() > 0 && a->elements<int>()[0] != 0) ? 1 : 0; };
+        const int is_main = rf("flag_main_cluster");
+        // cluster_t0 (double; unmatched clusters carry -1e12 -> out of window)
+        double t0 = 0;
+        { auto a = cs.get("cluster_t0"); if (a && a->size_major() > 0) t0 = a->elements<double>()[0]; }
+        const bool in_window = (t0 >= m_beam_window_low && t0 < m_beam_window_high);
+        tagger_candidate = (is_main != 0) && in_window;
+        tag_stm = rf("flag_STM");
+        tag_tgm = rf("flag_TGM");
+        tag_fc  = rf("flag_FC");
       }
     }
     for (auto* bnode : cnode->children()) {
@@ -1099,21 +1138,49 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
 
       // debug Bee dump (sim only -- truth-derived): 3d points in raw coords,
       // cluster_id = trackid.
-      if (is_sim && m_bee_sink) {
+      if (m_bee_sink) {
         auto dit = lpcs.find("3d");
         if (dit != lpcs.end() && dit->second.size_major() > 0) {
-          const auto x = dit->second.get("x")->elements<double>();
-          const auto y = dit->second.get("y")->elements<double>();
-          const auto z = dit->second.get("z")->elements<double>();
+          auto& d3 = dit->second;
+          const auto x = d3.get("x")->elements<double>();
+          const auto y = d3.get("y")->elements<double>();
+          const auto z = d3.get("z")->elements<double>();
+          // Tagger sets overlay clustering_global, so they use the SAME corrected
+          // coords (m_tagger_coords: data x_t0cor/y_cor/z_cor, sim x_sce/y_sce/
+          // z_sce).  Fall back to the raw x,y,z when unset or absent.  Copied into
+          // owned vectors (elements<>() may return a temporary).
+          std::vector<double> txv, tyv, tzv;
+          if (m_tagger_coords.size() == 3) {
+            auto ax = d3.get(m_tagger_coords[0]);
+            auto ay = d3.get(m_tagger_coords[1]);
+            auto az = d3.get(m_tagger_coords[2]);
+            if (ax && ay && az &&
+                ax->size_major() == x.size() && ay->size_major() == x.size() &&
+                az->size_major() == x.size()) {
+              auto sx = ax->elements<double>(); txv.assign(sx.begin(), sx.end());
+              auto sy = ay->elements<double>(); tyv.assign(sy.begin(), sy.end());
+              auto sz = az->elements<double>(); tzv.assign(sz.begin(), sz.end());
+            }
+          }
+          const bool have_tc = !txv.empty();
           const double q = scalar.get("charge")->elements<double>()[0];
           const double qpp = x.size() ? std::max(q / x.size(), 1.0) : 1.0;
           const int cid = bee_cid(tid);
           for (size_t i = 0; i < x.size(); ++i) {
-            if (tid >= 0) {
-              bpts.append(Point(x[i], y[i], z[i]), qpp, cid, cid);
+            const Point p(x[i], y[i], z[i]);
+            // truth-derived sets: sim only (true depo positions -> raw coords)
+            if (is_sim) {
+              if (tid >= 0) { bpts.append(p, qpp, cid, cid); }
+              else { bpts_unlab.append(p, qpp, reco_clid, reco_clid); }
             }
-            else {
-              bpts_unlab.append(Point(x[i], y[i], z[i]), qpp, reco_clid, reco_clid);
+            // tagger verdict sets: sim AND data; only beam-window main candidates
+            // are dumped, cluster_id = 0 (not tagged) / 1 (tagged), real_cluster_id
+            // 0 (Bee colors by cluster_id).  Coords match clustering_global.
+            if (tagger_candidate) {
+              const Point pt = have_tc ? Point(txv[i], tyv[i], tzv[i]) : p;
+              bpts_stm.append(pt, qpp, tag_stm, 0);
+              bpts_tgm.append(pt, qpp, tag_tgm, 0);
+              bpts_fc.append(pt, qpp, tag_fc, 0);
             }
           }
         }
@@ -1556,20 +1623,27 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   out = std::make_shared<SimpleTensorSet>(ident, set_md,
                                           std::make_shared<ITensor::vector>(outtens));
 
-  if (is_sim && m_bee_sink) {
-    m_bee_sink->write(bpts, m_bee_index, m_run, m_sub, m_evt);
-    m_bee_sink->write(bpts_unlab, m_bee_index, m_run, m_sub, m_evt);
-    if (!bpts_depo.empty()) {
-      m_bee_sink->write(bpts_depo, m_bee_index, m_run, m_sub, m_evt);
+  if (m_bee_sink) {
+    // truth-derived sets: sim only
+    if (is_sim) {
+      m_bee_sink->write(bpts, m_bee_index, m_run, m_sub, m_evt);
+      m_bee_sink->write(bpts_unlab, m_bee_index, m_run, m_sub, m_evt);
+      if (!bpts_depo.empty()) {
+        m_bee_sink->write(bpts_depo, m_bee_index, m_run, m_sub, m_evt);
+      }
+      if (!bpts_sr.empty()) {
+        m_bee_sink->write(bpts_sr, m_bee_index, m_run, m_sub, m_evt);
+      }
+      if (!m_pf_particles.empty()) {
+        Bee::ParticleTree pf(m_bee_pf_name);
+        pf.set_particles(m_pf_particles);
+        m_bee_sink->write(pf, m_bee_index, m_run, m_sub, m_evt);
+      }
     }
-    if (!bpts_sr.empty()) {
-      m_bee_sink->write(bpts_sr, m_bee_index, m_run, m_sub, m_evt);
-    }
-    if (!m_pf_particles.empty()) {
-      Bee::ParticleTree pf(m_bee_pf_name);
-      pf.set_particles(m_pf_particles);
-      m_bee_sink->write(pf, m_bee_index, m_run, m_sub, m_evt);
-    }
+    // tagger verdict sets: sim AND data
+    m_bee_sink->write(bpts_stm, m_bee_index, m_run, m_sub, m_evt);
+    m_bee_sink->write(bpts_tgm, m_bee_index, m_run, m_sub, m_evt);
+    m_bee_sink->write(bpts_fc, m_bee_index, m_run, m_sub, m_evt);
     ++m_bee_index;
   }
 

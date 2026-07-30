@@ -178,6 +178,7 @@
 
 #include "WireCellAux/Logger.h"
 #include "WireCellClus/IBeeSink.h"
+#include "WireCellUtil/Units.h"
 #include "WireCellClus/IPCTransform.h"
 #include "WireCellIface/IAnodePlane.h"
 #include "WireCellIface/IDetectorVolumes.h"
@@ -330,6 +331,17 @@ namespace WireCell::AIML {
     // optional shared Bee sink for the truth_trackid debug dump
     Clus::IBeeSink::pointer m_bee_sink{nullptr};
     std::string m_bee_detector{"sbnd"};
+    // Coordinate array names (in each blob's "3d" PC) for the tagger_stm/tgm/fc
+    // Bee sets, so they overlay clustering_global.  Set from the entry config to
+    // the same corrected scope clustering_global uses: data ['x_t0cor','y_cor',
+    // 'z_cor'], sim ['x_sce','y_sce','z_sce'].  Empty -> fall back to raw x,y,z.
+    std::vector<std::string> m_tagger_coords{};
+    // Beam gate (internal units) for the tagger Bee cluster_id encoding: a
+    // main_cluster is a "beam-window candidate" (the taggers only evaluate these)
+    // when its cluster_t0 is in [low, high).  MUST match the tagger's beam_window
+    // (run_nusel BEAM_WINDOW="0.2,2.2" us).  Overridable via cfg "beam_window".
+    double m_beam_window_low{0.2 * WireCell::units::us};
+    double m_beam_window_high{2.2 * WireCell::units::us};
     std::string m_bee_algorithm{"truth_trackid_labeled"};
     std::string m_bee_unlabeled_algorithm{"truth_unlabeled"};
     // SED pseudo-sim clouds (see PSEUDO-SIM in the class header):
