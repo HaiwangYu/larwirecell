@@ -118,6 +118,35 @@ static std::string pdg_name(int pdg)
   }
 }
 
+// Human-readable name for simb::MCNeutrino::InteractionType() (the "mc" tree
+// text).  Handles both the base int_type_ enum (0..13) and the Nuance-offset
+// codes (1000+) GENIE writes -- families collapsed to a short mode name.
+// (nusimdata SimulationBase/MCNeutrino.h.)
+static std::string int_type_name(int t)
+{
+  switch (t) {
+    case -1: return "unknown";
+    case 0:  return "QE";     case 1:  return "RES";   case 2:  return "DIS";
+    case 3:  return "COH";    case 4:  return "CohElastic";
+    case 5:  return "NuEEL";  case 6:  return "IMDAnn"; case 7:  return "IBD";
+    case 8:  return "Glashow";case 9:  return "AMNuGamma";
+    case 10: return "MEC";    case 11: return "Diffractive";
+    case 12: return "EM";     case 13: return "WeakMix";
+  }
+  // Nuance-offset codes: InteractionType = kNuanceOffset(1000) + NuanceReactionCode
+  // (GENIE2ART.cxx).  MEC/2p2h has no NUANCE code -> reaction code 0 -> exactly 1000.
+  if (t == 1000 || t == 1010)              return "MEC";
+  if (t == 1001 || t == 1002 || t == 1095) return "QE";   // (N)CQE, CCQEHyperon
+  if (t >= 1003 && t <= 1090)              return "RES";
+  if (t == 1091 || t == 1092)              return "DIS";
+  if (t == 1096 || t == 1097)              return "COH";
+  if (t == 1098)                           return "NuEEL";
+  if (t == 1099)                           return "IMD";
+  char buf[24];
+  std::snprintf(buf, sizeof(buf), "int %d", t);
+  return buf;
+}
+
 AIML::TensorSetLabeler::TensorSetLabeler()
   : Aux::Logger("TensorSetLabeler", "aiml")
   , m_drift_speed(1.563 * units::mm / units::us)
@@ -652,8 +681,10 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
   struct NuNode {
     bool valid{false};
     int pdg{0};
+    int int_type{-1};   // simb::MCNeutrino::InteractionType()
     double vx{0}, vy{0}, vz{0};
-    double etot{0}; // incoming neutrino total energy [MeV]
+    double etot{0};     // incoming neutrino total energy [MeV]
+    double time{0};     // interaction time [us] (nu vertex 4-position T)
   };
   std::vector<NuNode> nutruths;
   if (mctruth_handle.isValid()) {
@@ -663,11 +694,13 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
         const auto& nu_p = mct.GetNeutrino().Nu();
         nn.valid = true;
         nn.pdg = nu_p.PdgCode();
+        nn.int_type = mct.GetNeutrino().InteractionType();
         const auto& pos = nu_p.Position(0);
         nn.vx = pos.X();
         nn.vy = pos.Y();
         nn.vz = pos.Z();
         nn.etot = nu_p.Momentum(0).E() * 1e3; // GeV -> MeV (original total nu energy)
+        nn.time = pos.T() * 1e-3;             // ns -> us (interaction time)
       }
       nutruths.push_back(nn);
     }
@@ -767,16 +800,20 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       // synthetic id: below the 1e7 GENIE trackid-offset range, unique per
       // interaction, no collision with G4 trackids.
       nu_node["id"] = 9000000 + nidx;
-      char text[96];
+      char text[160];
       if (nidx < (int)nutruths.size() && nutruths[nidx].valid) {
         const auto& nn = nutruths[nidx];
-        // text = "<nu_idx> <flavor> Etot <total nu E> MeV Edep <deposited> MeV".
+        // text = "<nu_idx> <nu type> <interaction type> Etot <total nu E> MeV
+        //         Edep <deposited> MeV T <interaction time> us".
         // nu_idx is the 1-based Bee convention (matches the sed point sets:
         // 1,2,... per beam-nu interaction); Etot is the incoming neutrino total
-        // energy, Edep the interaction's deposited (visible) energy.
+        // energy, Edep the interaction's deposited (visible) energy, T the
+        // interaction time (nu vertex 4-position T, us).
         const double edep_mev = m_nu_edep.count(nidx) ? m_nu_edep.at(nidx) : 0.0;
-        std::snprintf(text, sizeof(text), "%d %s Etot %.1f MeV Edep %.1f MeV",
-                      nidx + 1, pdg_name(nn.pdg).c_str(), nn.etot, edep_mev);
+        std::snprintf(text, sizeof(text),
+                      "%d %s %s Etot %.1f MeV Edep %.1f MeV T %.3f us",
+                      nidx + 1, pdg_name(nn.pdg).c_str(),
+                      int_type_name(nn.int_type).c_str(), nn.etot, edep_mev, nn.time);
         Configuration dj;
         dj["start"][0] = nn.vx; // cm, as Bee wants
         dj["start"][1] = nn.vy;
@@ -931,15 +968,20 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     }
     return t;
   };
-  // Two SED pseudo-sim clouds (see PSEUDO-SIM in the header):
+  // Three SED pseudo-sim clouds (see PSEUDO-SIM in the header):
   //   sed-sce_drift_smear_readout: all 4 effects (overlays the blobs),
-  //   sed-smear_readout: smear + readout only, at the TRUE position.
+  //   sed-smear_readout: smear + readout only, at the TRUE position,
+  //   sed-sce_smear_readout: SCE + smear + readout (readout cut on the full
+  //     SCE+drift time), drawn at the SCE-only position (no drift-x shift).
   Bee::Points bpts_depo(m_bee_detector, m_bee_depo_algorithm);
   bpts_depo.rse(m_run, m_sub, m_evt);
   Bee::Points bpts_sr(m_bee_detector, m_bee_sr_algorithm);
   bpts_sr.rse(m_run, m_sub, m_evt);
+  Bee::Points bpts_ssr(m_bee_detector, m_bee_ssr_algorithm);
+  bpts_ssr.rse(m_run, m_sub, m_evt);
   const bool dump_sdsr = is_sim && m_bee_sink && m_sce && m_sce_correction; // needs SCE chain
   const bool dump_sr = is_sim && (bool)m_bee_sink;                          // sim only
+  const bool dump_ssr = is_sim && m_bee_sink && m_sce && m_sce_correction;  // needs SCE chain
   const int nsample = std::max(1, m_nsample_depo);
   std::normal_distribution<double> gaus(0.0, 1.0);
   double max_stick = 0; // widest depo time-sigma, sets the blob tick window
@@ -1011,6 +1053,14 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
         dump_ball(bpts_sr, fc, x_app, d.x0, d.y0, d.z0, d.x0,
                   d.trackid, d.q, d.e, d.nu_idx);
       }
+      if (dump_ssr) {
+        // SCE+smear+readout: readout cut on the FULL SCE+drift time (x_app),
+        // but the point sits at the SCE reco position (d.x, no drift-x shift);
+        // diffusion sigma from the SCE reco drift distance (d.x).  Isolates the
+        // SCE displacement from the drift-x apparent shift of sed-sce_drift_....
+        dump_ball(bpts_ssr, fc, x_app, d.x, d.y, d.z, d.x,
+                  d.trackid, d.q, d.e, d.nu_idx);
+      }
       const Point pos(d.x, d.y, d.z);
       // Wire-in-plane indices from the face RayGrid -- the same coordinates
       // the tiling used to define the blob strip bounds (layers 2,3,4 =
@@ -1041,6 +1091,10 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   Bee::Points bpts_stm(m_bee_detector, "tagger_stm"); bpts_stm.rse(m_run, m_sub, m_evt);
   Bee::Points bpts_tgm(m_bee_detector, "tagger_tgm"); bpts_tgm.rse(m_run, m_sub, m_evt);
   Bee::Points bpts_fc (m_bee_detector, "tagger_fc");  bpts_fc.rse(m_run, m_sub, m_evt);
+  // LM (light-mismatch) verdict from QLMatching's lm_tagger: the cluster scalar
+  // "lm_flag" (0 pass / 1 low-energy / 2 light-mismatch).  Binary encoding to
+  // match fc/stm/tgm: cluster_id = 1 iff lm_flag==2 (the nusel LM label), else 0.
+  Bee::Points bpts_lm (m_bee_detector, "tagger_lm");  bpts_lm.rse(m_run, m_sub, m_evt);
 
   size_t nblobs = 0, nlabeled = 0;
   for (auto* cnode : root->children()) {
@@ -1053,7 +1107,7 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     // omitted entirely, so the display is just the candidates, colored by verdict:
     //   cluster_id = 0 (not tagged) / 1 (tagged, flag_STM/TGM/FC set).
     bool tagger_candidate = false;
-    int tag_stm = 0, tag_tgm = 0, tag_fc = 0;
+    int tag_stm = 0, tag_tgm = 0, tag_fc = 0, tag_lm = 0;
     {
       auto cit = cnode->value.local_pcs().find("cluster_scalar");
       if (cit != cnode->value.local_pcs().end()) {
@@ -1072,6 +1126,9 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
         tag_stm = rf("flag_STM");
         tag_tgm = rf("flag_TGM");
         tag_fc  = rf("flag_FC");
+        // lm_flag is a 3-state int (0/1/2), not a boolean flag: tag iff ==2.
+        { auto a = cs.get("lm_flag");
+          tag_lm = (a && a->size_major() > 0 && a->elements<int>()[0] == 2) ? 1 : 0; }
       }
     }
     for (auto* bnode : cnode->children()) {
@@ -1181,6 +1238,7 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
               bpts_stm.append(pt, qpp, tag_stm, 0);
               bpts_tgm.append(pt, qpp, tag_tgm, 0);
               bpts_fc.append(pt, qpp, tag_fc, 0);
+              bpts_lm.append(pt, qpp, tag_lm, 0);
             }
           }
         }
@@ -1634,6 +1692,9 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       if (!bpts_sr.empty()) {
         m_bee_sink->write(bpts_sr, m_bee_index, m_run, m_sub, m_evt);
       }
+      if (!bpts_ssr.empty()) {
+        m_bee_sink->write(bpts_ssr, m_bee_index, m_run, m_sub, m_evt);
+      }
       if (!m_pf_particles.empty()) {
         Bee::ParticleTree pf(m_bee_pf_name);
         pf.set_particles(m_pf_particles);
@@ -1644,6 +1705,7 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     m_bee_sink->write(bpts_stm, m_bee_index, m_run, m_sub, m_evt);
     m_bee_sink->write(bpts_tgm, m_bee_index, m_run, m_sub, m_evt);
     m_bee_sink->write(bpts_fc, m_bee_index, m_run, m_sub, m_evt);
+    m_bee_sink->write(bpts_lm, m_bee_index, m_run, m_sub, m_evt);
     ++m_bee_index;
   }
 

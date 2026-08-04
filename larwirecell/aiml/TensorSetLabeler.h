@@ -347,6 +347,7 @@ namespace WireCell::AIML {
     // SED pseudo-sim clouds (see PSEUDO-SIM in the class header):
     std::string m_bee_depo_algorithm{"sed-sce_drift_smear_readout"}; // all 4 effects
     std::string m_bee_sr_algorithm{"sed-smear_readout"};             // smear + readout only
+    std::string m_bee_ssr_algorithm{"sed-sce_smear_readout"};        // SCE + smear + readout (no drift shift)
     std::string m_bee_pf_name{"mc"};
     int m_bee_index{0};
 
