@@ -682,6 +682,7 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
     bool valid{false};
     int pdg{0};
     int int_type{-1};   // simb::MCNeutrino::InteractionType()
+    int ccnc{-1};       // simb::MCNeutrino::CCNC() (0 = CC, 1 = NC)
     double vx{0}, vy{0}, vz{0};
     double etot{0};     // incoming neutrino total energy [MeV]
     double time{0};     // interaction time [us] (nu vertex 4-position T)
@@ -695,6 +696,7 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
         nn.valid = true;
         nn.pdg = nu_p.PdgCode();
         nn.int_type = mct.GetNeutrino().InteractionType();
+        nn.ccnc = mct.GetNeutrino().CCNC(); // 0 = CC, 1 = NC
         const auto& pos = nu_p.Position(0);
         nn.vx = pos.X();
         nn.vy = pos.Y();
@@ -803,17 +805,18 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       char text[160];
       if (nidx < (int)nutruths.size() && nutruths[nidx].valid) {
         const auto& nn = nutruths[nidx];
-        // text = "<nu_idx> <nu type> <interaction type> Etot <total nu E> MeV
-        //         Edep <deposited> MeV T <interaction time> us".
+        // text = "<nu_idx> <nu type> <interaction type> <CC|NC> Etot <total nu E>
+        //         MeV Edep <deposited> MeV T <interaction time> us".
         // nu_idx is the 1-based Bee convention (matches the sed point sets:
         // 1,2,... per beam-nu interaction); Etot is the incoming neutrino total
         // energy, Edep the interaction's deposited (visible) energy, T the
-        // interaction time (nu vertex 4-position T, us).
+        // interaction time (nu vertex 4-position T, us); CC/NC = MCNeutrino::CCNC.
         const double edep_mev = m_nu_edep.count(nidx) ? m_nu_edep.at(nidx) : 0.0;
+        const char* ccnc = nn.ccnc == 0 ? "CC" : (nn.ccnc == 1 ? "NC" : "??");
         std::snprintf(text, sizeof(text),
-                      "%d %s %s Etot %.1f MeV Edep %.1f MeV T %.3f us",
+                      "%d %s %s %s Etot %.1f MeV Edep %.1f MeV T %.3f us",
                       nidx + 1, pdg_name(nn.pdg).c_str(),
-                      int_type_name(nn.int_type).c_str(), nn.etot, edep_mev, nn.time);
+                      int_type_name(nn.int_type).c_str(), ccnc, nn.etot, edep_mev, nn.time);
         Configuration dj;
         dj["start"][0] = nn.vx; // cm, as Bee wants
         dj["start"][1] = nn.vy;
@@ -1252,6 +1255,16 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   if (m_hdf5_output) {
     namespace Fac = WireCell::Clus::Facade;
     auto* grouping = root->value.facade<Fac::Grouping>();
+    // Anodes + detector-volumes are NOT serialized in the point-cloud tree, so
+    // the deserialized grouping has empty m_anodes/m_dv -> Grouping::fill_cache
+    // raises "anode is null" (and later map_nticks_per_slice stays empty ->
+    // map::at) when the "ctpc" graph flavor is built.  MABC sets both on its
+    // live grouping (set_anodes + set_detector_volumes); do the same here from
+    // the config members we already hold, so the ctpc/closely graph can build.
+    if (grouping) {
+      if (!m_anodes.empty()) grouping->set_anodes(m_anodes);
+      if (m_dv) grouping->set_detector_volumes(m_dv);
+    }
     auto sc_i = [](Dataset& s, const char* k) -> long long {
       auto a = s.get(k); return a ? (long long)a->elements<int>()[0] : 0; };
     auto sc_d = [](Dataset& s, const char* k) -> double {
