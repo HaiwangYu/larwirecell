@@ -1290,6 +1290,7 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     std::vector<float> sp_pos, sp_feat, sp_rawvtx;
     std::vector<long long> sp_sem, sp_inst;
     std::vector<long long> sp_bundle_id, sp_segment_id;
+    std::vector<long long> sp_apa_vec, sp_face_vec;
     std::vector<BInfo> binfo;
     std::unordered_map<const Fac::Blob*, int> blob2idx;
     std::vector<Fac::Cluster*> clusters;
@@ -1362,6 +1363,8 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
         bi.smax = (int)sc_i(s, "slice_index_max");
         bi.tid = tid; bi.sem = sem; bi.vd = vd; bi.vdx = vdx; bi.vdy = vdy; bi.vdz = vdz;
         binfo.push_back(bi);
+        sp_apa_vec.push_back(bi.apa);
+        sp_face_vec.push_back(bi.face);
         blob2idx[blob] = gidx++;
       }
     }
@@ -1439,6 +1442,10 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     }
     log->debug("nugraph: {} sp-sp edges ({})", bbset.size(),
                (tried_ctpc && ctpc_ok) ? "ctpc flavor" : "knn fallback");
+    // sp_topology_source enum stored in metadata/sp_topology_source:
+    //   1 = CTPC          (m_dv+m_pcts configured; find_graph("ctpc") succeeded)
+    //   2 = KNN_FALLBACK  (m_dv/m_pcts not configured, or ctpc threw)
+    const long long sp_topology_source = (tried_ctpc && ctpc_ok) ? 1LL : 2LL;
 
     // ---- 2D (u/v/y) nodes from the grouping ctpc_a*f*p{U,V,W} PCs ----
     struct Node2D {
@@ -1593,6 +1600,9 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       addI("metadata/event", {m_evt}, {});
       addI("evt/num_nodes", {1}, {});
       addI("evt/y", {has_nu ? 1LL : 0LL}, {1});
+      // SP edge topology provenance: 1=CTPC, 2=KNN_FALLBACK.
+      // Matches the debug log "ctpc flavor" / "knn fallback" message above.
+      addI("metadata/sp_topology_source", {sp_topology_source}, {});
 
       // sp nodes
       addF("sp/pos", std::move(sp_pos), {(unsigned long long)Nsp, 3});
@@ -1613,6 +1623,11 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       //       sp/features[:,1].astype(int64) for all SPs.
       addI("sp/reco_bundle_id", std::move(sp_bundle_id), {(unsigned long long)Nsp});
       addI("sp/reco_segment_id", std::move(sp_segment_id), {(unsigned long long)Nsp});
+      // Detector partition metadata: which APA and face each SP blob belongs to.
+      // Sourced from wpid.apa()/wpid.face() -- the same values used for nexus
+      // edge APA/face filtering (line ~1542).  Do NOT derive from coordinates.
+      addI("sp/apa", std::move(sp_apa_vec), {(unsigned long long)Nsp});
+      addI("sp/face", std::move(sp_face_vec), {(unsigned long long)Nsp});
 
       // sp supervision edges from the blob-blob graph, labeled by trackid.
       {
@@ -1641,7 +1656,7 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       for (int pl = 0; pl < 3; ++pl) {
         const auto& nn = nodes2d[pl];
         const int M = (int)nn.size();
-        std::vector<float> pos, x15; std::vector<long long> id;
+        std::vector<float> pos, x15; std::vector<long long> id, n_apa, n_face;
         for (int i = 0; i < M; ++i) {
           pos.push_back((float)(nn[i].x / units::mm));
           pos.push_back((float)(nn[i].pitch / units::mm));
@@ -1656,6 +1671,8 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
           x15.push_back(n2_vtx[pl][4 * i + 3]);
           for (int z = 0; z < 6; ++z) { x15.push_back(0.f); } // sidecar zeros
           id.push_back(i);
+          n_apa.push_back(nn[i].apa);
+          n_face.push_back(nn[i].face);
         }
         const std::string p = plane_names[pl];
         if (M > 0) {
@@ -1664,6 +1681,10 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
           addI(p + "/id", std::move(id), {(unsigned long long)M});
           addI(p + "/y_semantic", std::move(n2_sem[pl]), {(unsigned long long)M});
           addI(p + "/y_instance", std::move(n2_inst[pl]), {(unsigned long long)M});
+          // Detector partition metadata for plane nodes (same APA/face source
+          // as the ctpc_ PC name parsed above).
+          addI(p + "/apa", std::move(n_apa), {(unsigned long long)M});
+          addI(p + "/face", std::move(n_face), {(unsigned long long)M});
         }
         else { // rare empty plane: one dummy node so members stay non-empty
           addF(p + "/pos", {0, 0}, {1, 2});
@@ -1671,6 +1692,8 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
           addI(p + "/id", {0}, {1});
           addI(p + "/y_semantic", {-1}, {1});
           addI(p + "/y_instance", {-1}, {1});
+          addI(p + "/apa", {0}, {1});
+          addI(p + "/face", {0}, {1});
         }
         add_edges(p + "_nexus_sp/edge_index", nx_src[pl], nx_dst[pl]);
       }
