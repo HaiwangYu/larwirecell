@@ -1289,6 +1289,7 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     };
     std::vector<float> sp_pos, sp_feat, sp_rawvtx;
     std::vector<long long> sp_sem, sp_inst;
+    std::vector<long long> sp_bundle_id, sp_segment_id;
     std::vector<BInfo> binfo;
     std::unordered_map<const Fac::Blob*, int> blob2idx;
     std::vector<Fac::Cluster*> clusters;
@@ -1300,6 +1301,22 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
         auto& cpc = cluster->value().local_pcs();
         auto it = cpc.find("cluster_scalar");
         if (it != cpc.end()) { auto a = it->second.get("ident"); if (a) reco_clid = a->elements<int>()[0]; }
+      }
+      // Read coarse bundle id from the first row of the cluster's perblob PC.
+      // stamp_matching_bundle_id() writes a constant value (cluster ident at
+      // stamp time) to every row, so reading row [0] is sufficient.  Falls back
+      // to kNoBundleId (-1) sentinel when matching_bundle_id is absent.
+      constexpr long long kNoBundleId = -1;
+      long long reco_bundle_id = kNoBundleId;
+      {
+        auto& lpcs = cluster->value().local_pcs();
+        auto pit = lpcs.find("perblob");
+        if (pit != lpcs.end()) {
+          auto a = pit->second.get("matching_bundle_id");
+          if (a && a->size_major() > 0) {
+            reco_bundle_id = (long long)a->elements<int>()[0];
+          }
+        }
       }
       for (auto* blob : cluster->children()) {
         auto& lpcs = blob->value().local_pcs();
@@ -1321,6 +1338,8 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
         sp_pos.push_back((float)(cx / units::mm));
         sp_pos.push_back((float)(cy / units::mm));
         sp_pos.push_back((float)(cz / units::mm));
+        // features: [charge, reco_clid, vtx_dist, vdx, vdy, vdz]
+        // features[:,1] == reco_clid == reco_segment_id (backward-compat invariant)
         sp_feat.push_back((float)q);
         sp_feat.push_back((float)reco_clid);
         sp_feat.push_back((float)vd);
@@ -1329,6 +1348,8 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
         sp_feat.push_back((float)vdz);
         sp_sem.push_back(sem);
         sp_inst.push_back(tid >= 0 ? tid : -1);
+        sp_bundle_id.push_back(reco_bundle_id);
+        sp_segment_id.push_back(reco_clid);
         sp_rawvtx.push_back((float)vd);
         BInfo bi;
         bi.apa = wpid.apa(); bi.face = wpid.face();
@@ -1578,7 +1599,20 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       addF("sp/features", std::move(sp_feat), {(unsigned long long)Nsp, 6});
       addF("sp/raw_vtx_dist", std::move(sp_rawvtx), {(unsigned long long)Nsp});
       addI("sp/y_semantic", std::move(sp_sem), {(unsigned long long)Nsp});
+      // sp/y_instance: G4 truth track-ID for instance-segmentation supervision.
+      // This is a TRUTH label (G4 track ID), NOT a reconstruction cluster identity.
+      // Reconstruction cluster identity is sp/reco_segment_id (or features[:,1]).
       addI("sp/y_instance", std::move(sp_inst), {(unsigned long long)Nsp});
+      // Reconstruction-provenance fields (additive; sp/features[:,1] unchanged):
+      //   sp/reco_bundle_id [N] int64 -- coarse Q/L flash-bundle id, event-local.
+      //       Stamped by stamp_matching_bundle_id() before the PR visitor loop so
+      //       coarse bundle membership survives ClusteringUnmergeBundle.  Equals
+      //       -1 (kNoBundleId sentinel) when matching_bundle_id is absent.
+      //   sp/reco_segment_id [N] int64 -- fine post-PR reconstruction cluster ident
+      //       (cluster_scalar["ident"]).  Backward-compat: identical to
+      //       sp/features[:,1].astype(int64) for all SPs.
+      addI("sp/reco_bundle_id", std::move(sp_bundle_id), {(unsigned long long)Nsp});
+      addI("sp/reco_segment_id", std::move(sp_segment_id), {(unsigned long long)Nsp});
 
       // sp supervision edges from the blob-blob graph, labeled by trackid.
       {
