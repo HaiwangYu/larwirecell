@@ -2,6 +2,7 @@
 
 cet_make_library(LIBRARY_NAME WireCellAIML
     SOURCE
+        EventGraphIPC.cxx
         Labelling2D.cxx
         TensorSetLabeler.cxx
         Truth2h5.cxx

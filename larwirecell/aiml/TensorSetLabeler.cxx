@@ -1,4 +1,5 @@
 #include "TensorSetLabeler.h"
+#include "EventGraphIPC.h"
 
 #include "WireCellAux/SimpleTensor.h"
 #include "WireCellAux/SimpleTensorSet.h"
@@ -32,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <unistd.h>
 #include <unordered_map>
 
 WIRECELL_FACTORY(wclsTensorSetLabeler,
@@ -227,7 +229,11 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   cfg["bee_michel_merge"] = m_bee_michel_merge;
   // nugraph HDF5 output (see HDF5 OUTPUT in the header).
   cfg["hdf5_output"] = m_hdf5_output;
+  cfg["hdf5_file_output"] = m_hdf5_file_output;
   cfg["hdf5_filename"] = m_hdf5_filename;
+  // EventGraph IPC: Unix socket path for the no-intermediate memory bridge.
+  // Empty (default) = disabled.  Also overridable via $EVENTGRAPH_IPC_PATH.
+  cfg["eventgraph_ipc_path"] = m_ipc_path;
   cfg["plane_knn"] = m_plane_knn;
   // IDetectorVolumes + IPCTransformSet for the "ctpc" blob-blob graph flavor.
   cfg["detector_volumes"] = "";
@@ -282,7 +288,16 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
   m_pf_ke_min = get(cfg, "pf_ke_min", m_pf_ke_min);
   m_bee_michel_merge = get(cfg, "bee_michel_merge", m_bee_michel_merge);
   m_hdf5_output = get(cfg, "hdf5_output", m_hdf5_output);
+  m_hdf5_file_output = get(cfg, "hdf5_file_output", m_hdf5_file_output);
   m_hdf5_filename = get(cfg, "hdf5_filename", m_hdf5_filename);
+  m_ipc_path = get(cfg, "eventgraph_ipc_path", m_ipc_path);
+  // Env var takes precedence over FCL config (for PBS orchestration).
+  if (const char* ep = std::getenv("EVENTGRAPH_IPC_PATH")) {
+    if (ep[0]) { m_ipc_path = ep; }
+  }
+  if (!m_ipc_path.empty()) {
+    log->debug("eventgraph_ipc: enabled, socket path={}", m_ipc_path);
+  }
   m_plane_knn = get(cfg, "plane_knn", m_plane_knn);
   {
     const std::string dv_tn = get<std::string>(cfg, "detector_volumes", "");
@@ -383,8 +398,15 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
 
 void AIML::TensorSetLabeler::finalize()
 {
-  if (m_hdf5_output) {
+  if (m_hdf5_output && m_hdf5_file_output) {
     write_hdf5();
+  }
+  if (m_ipc_fd >= 0) {
+    // Send END_OF_STREAM so the Python receiver can exit cleanly.
+    AIML::send_end_of_stream(m_ipc_fd, m_run, m_sub, m_evt);
+    ::close(m_ipc_fd);
+    m_ipc_fd = -1;
+    log->debug("eventgraph_ipc: closed");
   }
   if (m_bee_sink) {
     m_bee_sink->release();
@@ -1696,6 +1718,51 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
           addI(p + "/face", {0}, {1});
         }
         add_edges(p + "_nexus_sp/edge_index", nx_src[pl], nx_dst[pl]);
+      }
+
+      // EventGraph IPC: send ev (while still valid) before moving it into m_events.
+      if (!m_ipc_path.empty()) {
+        // Lazy-connect on the first event (allows Python receiver to start first).
+        if (m_ipc_fd < 0) {
+          m_ipc_fd = AIML::connect_unix_socket(m_ipc_path);
+          if (m_ipc_fd < 0) {
+            log->error("eventgraph_ipc: could not connect to {}", m_ipc_path);
+            THROW(ValueError() << errmsg{"EventGraph IPC connect failed: " + m_ipc_path});
+          }
+          log->debug("eventgraph_ipc: connected, fd={} path={}", m_ipc_fd, m_ipc_path);
+        }
+        // Build lightweight views (pointers into ev — valid here, before std::move).
+        std::vector<AIML::EventGraphMemberView> views;
+        views.reserve(ev.members.size());
+        for (const auto& mbr : ev.members) {
+          AIML::EventGraphMemberView v;
+          v.name       = mbr.name.c_str();
+          v.is_float   = mbr.is_float;
+          v.rank       = static_cast<int>(mbr.dims.size());
+          // unsigned long long == uint64_t on x86_64; safe reinterpret.
+          v.dims       = reinterpret_cast<const uint64_t*>(mbr.dims.data());
+          if (mbr.is_float) {
+            v.data       = mbr.f.data();
+            v.byte_count = mbr.f.size() * sizeof(float);
+          }
+          else {
+            v.data       = mbr.i.data();
+            v.byte_count = mbr.i.size() * sizeof(long long);
+          }
+          views.push_back(v);
+        }
+        const bool has_truth = (m_reality == "sim");
+        if (!AIML::send_event_graph(m_ipc_fd, ev.sample_name.c_str(),
+                                     m_run, m_sub, m_evt, has_truth,
+                                     views.data(), static_cast<int>(views.size()))) {
+          log->error("eventgraph_ipc: send failed rse=({},{},{})", m_run, m_sub, m_evt);
+          THROW(ValueError() << errmsg{"EventGraph IPC send failed"});
+        }
+        if (!AIML::wait_for_ack(m_ipc_fd, m_run, m_sub, m_evt)) {
+          log->error("eventgraph_ipc: ACK failed rse=({},{},{})", m_run, m_sub, m_evt);
+          THROW(ValueError() << errmsg{"EventGraph IPC ACK failed"});
+        }
+        log->debug("eventgraph_ipc: sent+acked rse=({},{},{})", m_run, m_sub, m_evt);
       }
 
       m_events.push_back(std::move(ev));
