@@ -347,7 +347,8 @@ namespace WireCell::AIML {
     // nugraph HDF5 output (heterogeneous graph for training/testing; see the
     // HDF5 OUTPUT section in the class header).  Accumulated per event and
     // written at finalize() as a pynuml H5DataModule container.
-    bool m_hdf5_output{true};      // write the nugraph .h5 (default on)
+    bool m_hdf5_output{true};      // build EventGraph + send IPC (default on)
+    bool m_hdf5_file_output{true}; // write nugraph.h5 file in finalize() (default on)
     std::string m_hdf5_filename{"nugraph.h5"};
     int m_plane_knn{6};            // sp-sp kNN fallback (see .cxx)
     // detector geometry for the "ctpc" blob-blob graph flavor (sp_nexus_sp)
@@ -393,6 +394,12 @@ namespace WireCell::AIML {
     std::set<int> m_nu_trackids;             // beam-nu-derived trackids (>=0), for node semantics
     WireCell::Configuration m_pf_particles;  // Bee "mc" jstree node array
     std::vector<EventGraph> m_events;        // accumulated nugraph records (written at finalize)
+    // EventGraph IPC transport (memory bridge to Python; off by default).
+    // Set eventgraph_ipc_path to a Unix-domain socket path, or set the env
+    // var EVENTGRAPH_IPC_PATH, to enable per-event streaming.  -1 = not yet
+    // connected.  Opened lazily on the first event and closed in finalize().
+    std::string m_ipc_path;
+    int m_ipc_fd{-1};
 
     size_t m_count{0};
     std::mt19937 m_rng{20260708}; // fixed seed: deterministic depo-ball sampling
