@@ -307,6 +307,38 @@ namespace WireCell::AIML {
     double m_sp_smear_wire_col{0.07839}; // SP wire smearing, W [pitch units]
     double m_nsigma{3.0};      // Gaussian acceptance half-width
     int m_nsample_depo{1};     // SED pseudo-sim Bee sets: samples per depo ball
+    // TWO-INSTANCE SUPPORT (sbnd/docs/5-pr-chain-in-1step.html sec 6.7).
+    // The labeler does four separable jobs; only the tagger Bee sets need the
+    // PR verdicts (flag_STM/TGM/FC), so a chain that wants truth attached to
+    // the PRE-PR clustering runs TWO configured instances, one either side of
+    // the PR MultiAlgBlobClustering node.  Both knobs default to the historical
+    // behavior, so a single-instance config compiles and runs byte-identically.
+    //
+    // m_label_blobs=false: skip the depo->blob projection AND the trackid
+    // write-back, reading the existing per-blob trackid instead.  Required for
+    // the DOWNSTREAM instance: the write-back is not gated on reality, so a
+    // second pass would otherwise stamp trackid=-1 over the labels the
+    // upstream instance wrote (data mode) or pay the projection twice (sim).
+    bool m_label_blobs{true};
+    // Bee families this instance emits ("bee_sets" config).  The tagger set
+    // NAMES are hardcoded ("tagger_stm", ...), not derived from bee_algorithm,
+    // so two instances sharing one bee_sink would write duplicate zip entries
+    // unless the families are split.
+    bool m_bee_truth{true};        // truth_trackid_labeled, truth_unlabeled
+    // The "mc" particle tree is its OWN family, separate from the point sets
+    // above, because Bee renders exactly one particle tree per event (bee.js
+    // fetches a hardcoded base_url + "mc/").  When the PR stage is going to
+    // publish the merged tree instead, this instance must stay silent while
+    // still handing its nodes over -- see m_pf_to_metadata.
+    bool m_bee_pf{true};           // the "mc" jsTree particle tree
+    bool m_bee_sed{true};          // sed-* pseudo-sim depo sets
+    bool m_bee_tagger{true};       // tagger_{stm,tgm,fc,lm}
+    // Publish the particle-tree array into the OUTPUT TensorSet metadata under
+    // this key (empty = off).  This is the transport by which a downstream
+    // MultiAlgBlobClustering can graft its own reco particle flow onto this
+    // truth tree and emit ONE merged "mc" -- the only way both can be seen,
+    // given Bee's single hardcoded particle-tree slot.
+    std::string m_pf_metadata_key{""};
     bool m_sce_correction{true};   // apply true->reco SCE shift to depos
     bool m_truth_tracks_nu_only{true}; // truth_per_track: only nu-origin particles
     bool m_pf_nu_only{true};           // "mc" tree: only beam-nu-derived particles

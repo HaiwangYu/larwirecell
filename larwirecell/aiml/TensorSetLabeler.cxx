@@ -179,6 +179,15 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   cfg["mctruth_label"] = m_mctruth_label;
   cfg["mcparticle_label"] = m_mcparticle_label;
   cfg["reality"] = m_reality;
+  // Two-instance knobs (header sec TWO-INSTANCE SUPPORT).  Defaults reproduce
+  // the single-instance behavior exactly.
+  cfg["label_blobs"] = m_label_blobs;
+  cfg["bee_sets"] = Json::arrayValue;
+  cfg["bee_sets"].append("truth");
+  cfg["bee_sets"].append("sed");
+  cfg["bee_sets"].append("tagger");
+  cfg["bee_sets"].append("pf");
+  cfg["pf_metadata_key"] = m_pf_metadata_key;
   // MUST match the BlobSampler configuration that made the "3d" PCs.
   cfg["drift_speed"] = m_drift_speed;
   cfg["time_offset"] = m_time_offset;
@@ -252,6 +261,23 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
   m_mctruth_label = get(cfg, "mctruth_label", m_mctruth_label);
   m_mcparticle_label = get(cfg, "mcparticle_label", m_mcparticle_label);
   m_reality = get(cfg, "reality", m_reality);
+  // Two-instance knobs (see the header).  Absent keys => historical behavior.
+  m_label_blobs = get(cfg, "label_blobs", m_label_blobs);
+  m_pf_metadata_key = get<std::string>(cfg, "pf_metadata_key", m_pf_metadata_key);
+  if (cfg["bee_sets"].isArray()) {
+    m_bee_truth = m_bee_sed = m_bee_tagger = m_bee_pf = false;
+    for (const auto& fam : cfg["bee_sets"]) {
+      const std::string f = fam.asString();
+      if      (f == "truth")  { m_bee_truth = true; }
+      else if (f == "sed")    { m_bee_sed = true; }
+      else if (f == "tagger") { m_bee_tagger = true; }
+      else if (f == "pf")     { m_bee_pf = true; }
+      else {
+        THROW(ValueError() << errmsg{"TensorSetLabeler: unknown bee_sets family '" + f
+                                     + "' (want truth|sed|tagger|pf)"});
+      }
+    }
+  }
   if (cfg["tagger_coords"].isArray() && cfg["tagger_coords"].size() == 3) {
     m_tagger_coords.clear();
     for (const auto& c : cfg["tagger_coords"]) m_tagger_coords.push_back(c.asString());
@@ -1015,7 +1041,14 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
                 q / nsample, cid, cid, e / nsample, nu_idx);
     }
   };
-  for (const auto& d : m_depos) {
+  // label_blobs=false (downstream instance): skip the projection entirely.
+  // m_depos is only consumed here and by the sed Bee sets filled inside this
+  // loop, so leaving `proj` empty is the whole of it -- and it is the expensive
+  // half of this component.
+  // Both ternary arms are lvalues of the same type, so this binds a reference
+  // and does NOT copy m_depos.
+  static const std::vector<Depo> s_no_depos;
+  for (const auto& d : (m_label_blobs ? m_depos : s_no_depos)) {
     const double tdep = d.t + m_depo_time_offset;
     for (const auto& [af, fc] : m_faces) {
       // apparent (drifted) x: later deposit -> deeper into the volume
@@ -1186,13 +1219,24 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
         }
       }
 
-      // write back into the scalar PC
-      if (scalar.has("trackid")) {
-        const int v = tid;
-        scalar.get("trackid")->assign(&v, PointCloud::Array::shape_t{1}, false);
+      // write back into the scalar PC -- ONLY when this instance owns the
+      // labeling.  With label_blobs=false the projection above never ran, so
+      // tid is still -1; writing it would erase the label an upstream instance
+      // put here (the write is deliberately not reality-gated).  Read the
+      // existing value instead, so the truth-derived Bee sets below still see
+      // the right trackid if this instance emits them.
+      if (m_label_blobs) {
+        if (scalar.has("trackid")) {
+          const int v = tid;
+          scalar.get("trackid")->assign(&v, PointCloud::Array::shape_t{1}, false);
+        }
+        else {
+          scalar.add("trackid", Array({(int)tid}));
+        }
       }
-      else {
-        scalar.add("trackid", Array({(int)tid}));
+      else if (scalar.has("trackid")) {
+        auto a = scalar.get("trackid");
+        if (a->size_major() > 0) { tid = a->elements<int>()[0]; }
       }
       if (tid >= 0) { ++nlabeled; }
 
@@ -1687,6 +1731,10 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   set_md["runNo"] = m_run;
   set_md["subRunNo"] = m_sub;
   set_md["eventNo"] = m_evt;
+  // Hand the particle tree to a downstream merger (see m_pf_metadata_key).
+  if (!m_pf_metadata_key.empty() && !m_pf_particles.empty()) {
+    set_md[m_pf_metadata_key] = m_pf_particles;
+  }
   for (const auto& key : m_evtmd.getMemberNames()) {
     set_md[key] = m_evtmd[key];
   }
@@ -1695,10 +1743,20 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
                                           std::make_shared<ITensor::vector>(outtens));
 
   if (m_bee_sink) {
+    // Families are selected by "bee_sets" so two instances sharing one sink do
+    // not write duplicate entries into the same zip (the tagger set names are
+    // hardcoded, not derived from bee_algorithm).  Default = all three.
     // truth-derived sets: sim only
-    if (is_sim) {
+    if (is_sim && m_bee_truth) {
       m_bee_sink->write(bpts, m_bee_index, m_run, m_sub, m_evt);
       m_bee_sink->write(bpts_unlab, m_bee_index, m_run, m_sub, m_evt);
+      if (m_bee_pf && !m_pf_particles.empty()) {
+        Bee::ParticleTree pf(m_bee_pf_name);
+        pf.set_particles(m_pf_particles);
+        m_bee_sink->write(pf, m_bee_index, m_run, m_sub, m_evt);
+      }
+    }
+    if (is_sim && m_bee_sed) {
       if (!bpts_depo.empty()) {
         m_bee_sink->write(bpts_depo, m_bee_index, m_run, m_sub, m_evt);
       }
@@ -1708,17 +1766,14 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       if (!bpts_ssr.empty()) {
         m_bee_sink->write(bpts_ssr, m_bee_index, m_run, m_sub, m_evt);
       }
-      if (!m_pf_particles.empty()) {
-        Bee::ParticleTree pf(m_bee_pf_name);
-        pf.set_particles(m_pf_particles);
-        m_bee_sink->write(pf, m_bee_index, m_run, m_sub, m_evt);
-      }
     }
     // tagger verdict sets: sim AND data
-    m_bee_sink->write(bpts_stm, m_bee_index, m_run, m_sub, m_evt);
-    m_bee_sink->write(bpts_tgm, m_bee_index, m_run, m_sub, m_evt);
-    m_bee_sink->write(bpts_fc, m_bee_index, m_run, m_sub, m_evt);
-    m_bee_sink->write(bpts_lm, m_bee_index, m_run, m_sub, m_evt);
+    if (m_bee_tagger) {
+      m_bee_sink->write(bpts_stm, m_bee_index, m_run, m_sub, m_evt);
+      m_bee_sink->write(bpts_tgm, m_bee_index, m_run, m_sub, m_evt);
+      m_bee_sink->write(bpts_fc, m_bee_index, m_run, m_sub, m_evt);
+      m_bee_sink->write(bpts_lm, m_bee_index, m_run, m_sub, m_evt);
+    }
     ++m_bee_index;
   }
 
