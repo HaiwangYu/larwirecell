@@ -10,6 +10,7 @@ cet_make_library(LIBRARY_NAME WireCellLarsoft
   CookedFrameSink.cxx
   CookedFrameSource.cxx
   TensorSetMetadataAttacher.cxx
+  TruthInformationAttacher.cxx
   DepoFluxWriter.cxx
   FrameSaver.cxx
   LazyFrameSource.cxx
@@ -46,6 +47,7 @@ cet_make_library(LIBRARY_NAME WireCellLarsoft
   larcore::ServiceUtil
   lardataobj::RecoBase
   lardataobj::RawData
+  nusimdata::SimulationBase
   art::Framework_Core
   art::Framework_Principal
   WireCell::Gen

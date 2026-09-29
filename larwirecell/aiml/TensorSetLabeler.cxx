@@ -1,4 +1,5 @@
 #include "TensorSetLabeler.h"
+#include "G4ProcessCode.h"
 
 #include "WireCellAux/SimpleTensor.h"
 #include "WireCellAux/SimpleTensorSet.h"
@@ -50,7 +51,7 @@ using WireCell::PointCloud::Dataset;
 
 // Columns of the "truth_per_track" tensor.  Units: LArSoft native
 // (positions cm, time ns, momentum/energy GeV).  "process" is the G4
-// creation-process code (see g4_process_code below).
+// creation-process code (aiml/G4ProcessCode.h).
 static const std::vector<std::string> track_columns = {
   "trackid",  "pdg",      "mother_trackid", "mother_pdg", "status",
   "start_x",  "start_y",  "start_z",        "start_t",    "start_px",
@@ -58,39 +59,10 @@ static const std::vector<std::string> track_columns = {
   "end_z",    "end_t",    "end_px",         "end_py",     "end_pz",
   "end_E",    "nu_idx",   "process"};
 
-// G4 creation-process name -> integer code, following the CellTree
-// convention (cf. Ningclover larwirecell/aiml/TrackIDPIDMap2h5.cxx).
-// Unknown processes map to -1.  "Michel" (10001) is not a G4 process: it
-// is a synthetic tag assigned by g4_process_code() below.
-static const std::unordered_map<std::string, int> g4_process_map = {
-  {"primary", 0},        {"Decay", 1},        {"eIoni", 2},
-  {"muIoni", 3},         {"eBrem", 4},        {"compt", 5},
-  {"phot", 6},           {"conv", 7},         {"hIoni", 8},
-  {"nCapture", 9},       {"muPairProd", 10},  {"CoulombScat", 11},
-  {"muBrems", 12},       {"LowEnConversion", 13}, {"annihil", 14},
-  {"neutronInelastic", 15}, {"hadElastic", 16},
-  {"hBertiniCaptureAtRest", 17}, {"muMinusCaptureAtRest", 18},
-  {"protonInelastic", 19}, {"pi+Inelastic", 20}, {"pi-Inelastic", 21},
-  {"PhotonInelastic", 22}, {"CHIPSNuclearCaptureAtRest", 23},
-  {"Transportation", 24}, {"kaon+Inelastic", 25}, {"kaon-Inelastic", 26},
-  {"kaon0LInelastic", 27}, {"ionInelastic", 28}, {"Scintillation", 29},
-  {"ionIoni", 30},       {"nKiller", 31},     {"StepLimiter", 32},
-  {"dInelastic", 33},    {"Michel", 10001}};
-
-// A Michel electron is an e+- created by the decay of a muon: pdg == e,
-// process == "Decay", mother pdg == mu.  Such tracks get the synthetic
-// "Michel" (10001) code; every other track maps its G4 process string.
-static const int kMichelCode = 10001;
-static bool is_michel(int pdg, const std::string& proc, int mother_pdg)
-{
-  return std::abs(pdg) == 11 && proc == "Decay" && std::abs(mother_pdg) == 13;
-}
-static int g4_process_code(int pdg, const std::string& proc, int mother_pdg)
-{
-  if (is_michel(pdg, proc, mother_pdg)) { return kMichelCode; }
-  auto it = g4_process_map.find(proc);
-  return it == g4_process_map.end() ? -1 : it->second;
-}
+// G4 creation-process code and the Michel test: aiml/G4ProcessCode.h (shared
+// with wclsTruthInformationAttacher).
+using wcls::truth::g4_process_code;
+using wcls::truth::is_michel;
 
 // Human-readable particle name for the Bee "mc" tree text.
 static std::string pdg_name(int pdg)
