@@ -395,7 +395,13 @@ namespace WireCell::AIML {
     std::vector<EventGraph> m_events;        // accumulated nugraph records (written at finalize)
 
     size_t m_count{0};
-    std::mt19937 m_rng{20260708}; // fixed seed: deterministic depo-ball sampling
+    // fixed seed: deterministic depo-ball sampling.  RE-SEEDED at every event
+    // (visit()), so an event's smeared sed Bee sets do not depend on how many
+    // events the process ran before it: a multi-event lar job (the 2-step
+    // chain's step 1, ai-helper issue 33) gives each event exactly what a
+    // one-event process gives.  One-event processes are unchanged.
+    static constexpr std::mt19937::result_type kRngSeed = 20260708;
+    std::mt19937 m_rng{kRngSeed};
   };
 }
 

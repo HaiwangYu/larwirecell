@@ -493,6 +493,7 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
   m_run = event.run();
   m_sub = event.subRun();
   m_evt = event.event();
+  m_rng.seed(kRngSeed);   // per-event determinism, see the header
   m_evtmd = Json::objectValue;
   m_tracks.clear();
   m_depos.clear();
