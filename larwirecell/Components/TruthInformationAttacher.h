@@ -12,7 +12,9 @@
  * tensors, if any, are appended.
  *
  * ALWAYS: "runNo", "subRunNo", "eventNo" are added to the set metadata (keys
- * configurable, as TensorSetMetadataAttacher).
+ * configurable, as TensorSetMetadataAttacher), and "input_file" (key
+ * "file_key"; "" disables it), the art input file of the event as art opened
+ * it (FileBlock::fileName(), via respond_to_open_input_file; ai-helper issue 39).
  *
  * truth=true AND the event carries a neutrino MCTruth (MC): two 2D double
  * tensors are appended.  Units LArSoft native: cm, ns, GeV.  Column names are
@@ -80,6 +82,8 @@ namespace wcls {
 
     /// IArtEventVisitor -- called at event start, before the graph runs.
     virtual void visit(art::Event& event);
+    // ai-helper issue 39: remember the art input file, stamped as metadata "input_file"
+    virtual void respond_to_open_input_file(const std::string& filename) { m_input_file = filename; }
 
     /// ITensorSetFilter
     virtual bool operator()(const input_pointer& in, output_pointer& out);
@@ -96,6 +100,8 @@ namespace wcls {
     std::string m_run_key{"runNo"};
     std::string m_sub_key{"subRunNo"};
     std::string m_evt_key{"eventNo"};
+    std::string m_file_key{"input_file"};   // set metadata key of the art input file name ("" = do not stamp)
+    std::string m_input_file;               // from respond_to_open_input_file()
     bool m_truth{true};
     std::string m_mctruth_label{"generator"};
     std::string m_mcparticle_label{"largeant"};

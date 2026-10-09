@@ -96,6 +96,16 @@ namespace wcls {
     }
     void process(art::Event& event);
 
+    void respond_to_open_input_file(const std::string& filename)
+    {
+      for (auto iaev : m_inputers) {
+        iaev->respond_to_open_input_file(filename);
+      }
+      for (auto iaev : m_outputers) {
+        iaev->respond_to_open_input_file(filename);
+      }
+    }
+
   private:
     WireCell::Main m_wcmain;
     wcls::IArtEventVisitor::vector m_inputers, m_outputers;

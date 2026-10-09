@@ -1,4 +1,5 @@
 #include "art/Framework/Core/ModuleMacros.h"
+#include "art/Framework/Core/FileBlock.h"
 #include "art/Framework/Core/SharedProducer.h"
 #include "art/Utilities/make_tool.h"
 #include "larwirecell/Interfaces/MainTool.h"
@@ -14,6 +15,8 @@ namespace wcls {
 
     void produce(art::Event& evt, art::ProcessingFrame const&);
     void reconfigure(fhicl::ParameterSet const& pset);
+    // ai-helper issue 39: hand the input artROOT file name to the WCT art-event visitors
+    void respondToOpenInputFile(art::FileBlock const& fb, art::ProcessingFrame const&) override;
 
   private:
     std::unique_ptr<wcls::MainTool> m_wcls;
@@ -32,6 +35,11 @@ wcls::WireCellToolkit::~WireCellToolkit() {}
 void wcls::WireCellToolkit::produce(art::Event& evt, art::ProcessingFrame const&)
 {
   m_wcls->process(evt);
+}
+
+void wcls::WireCellToolkit::respondToOpenInputFile(art::FileBlock const& fb, art::ProcessingFrame const&)
+{
+  m_wcls->respond_to_open_input_file(fb.fileName());
 }
 
 void wcls::WireCellToolkit::reconfigure(fhicl::ParameterSet const& pset)

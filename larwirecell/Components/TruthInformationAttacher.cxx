@@ -59,6 +59,7 @@ Configuration TruthInformationAttacher::default_configuration() const
   cfg["run_key"] = m_run_key;
   cfg["subrun_key"] = m_sub_key;
   cfg["event_key"] = m_evt_key;
+  cfg["file_key"] = m_file_key;   // metadata key of the art input file name; "" = do not stamp (issue 39)
   cfg["truth"] = m_truth;
   cfg["mctruth_label"] = m_mctruth_label;
   cfg["mcparticle_label"] = m_mcparticle_label;
@@ -74,6 +75,7 @@ void TruthInformationAttacher::configure(const Configuration& cfg)
   m_run_key = get<std::string>(cfg, "run_key", m_run_key);
   m_sub_key = get<std::string>(cfg, "subrun_key", m_sub_key);
   m_evt_key = get<std::string>(cfg, "event_key", m_evt_key);
+  m_file_key = get<std::string>(cfg, "file_key", m_file_key);
   m_truth = get<bool>(cfg, "truth", m_truth);
   m_mctruth_label = get<std::string>(cfg, "mctruth_label", m_mctruth_label);
   m_mcparticle_label = get<std::string>(cfg, "mcparticle_label", m_mcparticle_label);
@@ -266,6 +268,9 @@ bool TruthInformationAttacher::operator()(const ITensorSet::pointer& in, ITensor
   md[m_run_key] = m_run;
   md[m_sub_key] = m_sub;
   md[m_evt_key] = m_evt;
+  if (!m_file_key.empty() && !m_input_file.empty()) {
+    md[m_file_key] = m_input_file;   // ai-helper issue 39: the art input file of this event
+  }
 
   if (m_n_nu == 0) {
     // RSE only: share the input tensors by pointer (no copy).

@@ -8,6 +8,8 @@
 #ifndef LARWIRECELL_INTERFACES_MAINTOOL
 #define LARWIRECELL_INTERFACES_MAINTOOL
 
+#include <string>
+
 namespace art {
   class Event;
   class ProducesCollector;
@@ -26,6 +28,10 @@ namespace wcls {
 
     /// Accept an event to process.
     virtual void process(art::Event& event) = 0;
+
+    /// art opened an input file; forwarded to the art-event visitors
+    /// (ai-helper issue 39).  Default: ignore.
+    virtual void respond_to_open_input_file(const std::string& /*filename*/) {}
   };
 }
 

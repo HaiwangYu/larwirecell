@@ -14,6 +14,8 @@
 
 #include "WireCellUtil/IComponent.h"
 
+#include <string>
+
 namespace art {
   class Event;
   class EDProducer;
@@ -31,6 +33,12 @@ namespace wcls {
 
     /// Implement to visit an Art event.
     virtual void visit(art::Event& event) = 0;
+
+    /// Called when art opens an input file (FileBlock::fileName(), as given to
+    /// art, e.g. a local path or an xrootd URL), before the events of that file
+    /// are visited.  Default: ignore.  (ai-helper issue 39: the input artROOT
+    /// path is carried into the WCT output as metadata.)
+    virtual void respond_to_open_input_file(const std::string& /*filename*/) {}
   };
 }
 #endif
