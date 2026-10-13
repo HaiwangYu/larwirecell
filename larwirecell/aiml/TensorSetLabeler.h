@@ -192,6 +192,7 @@
 #include <map>
 #include <random>
 #include <set>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -320,6 +321,15 @@ namespace WireCell::AIML {
     // second pass would otherwise stamp trackid=-1 over the labels the
     // upstream instance wrote (data mode) or pay the projection twice (sim).
     bool m_label_blobs{true};
+    // ai-helper issue 41 ("truth_detail" config, default false): with
+    // label_blobs, also write per-blob truth_q (electrons of every accepted
+    // depo), truth_q_dom (the dominant track's), trackid2 / truth_q2 (the
+    // runner-up), and the per-event "truth_track" tensor (one row per G4 track
+    // with deposits: nu_idx, Michel-merged id, ancestor, pdg, the charge inside
+    // the readout window and the part of it accepted by some blob) at
+    // m_truth_track_datapath.  Off: byte-identical to before.
+    bool m_truth_detail{false};
+    std::string m_truth_track_datapath{"truthtrack/%d"};
     // Bee families this instance emits ("bee_sets" config).  The tagger set
     // NAMES are hardcoded ("tagger_stm", ...), not derived from bee_algorithm,
     // so two instances sharing one bee_sink would write duplicate zip entries
@@ -391,6 +401,12 @@ namespace WireCell::AIML {
     std::map<int, int> m_michel_mother;      // Michel e- trackid -> mother muon trackid
     std::map<int, double> m_nu_edep;         // nu_idx -> sum SED Energy() [MeV] of that interaction
     std::set<int> m_nu_trackids;             // beam-nu-derived trackids (>=0), for node semantics
+    // issue 41 (truth_detail): every MCParticle of the event by trackid.
+    struct McpInfo {
+      int pdg{0}, mother{0}, mother_pdg{0}, process{0}, nu_index{-1};
+      double sx{0}, sy{0}, sz{0}, st{0}, sE{0}, ex{0}, ey{0}, ez{0};
+    };
+    std::unordered_map<int, McpInfo> m_mcp;
     WireCell::Configuration m_pf_particles;  // Bee "mc" jstree node array
     std::vector<EventGraph> m_events;        // accumulated nugraph records (written at finalize)
 

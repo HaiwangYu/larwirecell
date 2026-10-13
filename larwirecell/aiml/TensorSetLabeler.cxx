@@ -154,6 +154,8 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   // Two-instance knobs (header sec TWO-INSTANCE SUPPORT).  Defaults reproduce
   // the single-instance behavior exactly.
   cfg["label_blobs"] = m_label_blobs;
+  cfg["truth_detail"] = m_truth_detail;                  // ai-helper issue 41
+  cfg["truth_track_datapath"] = m_truth_track_datapath;  // ai-helper issue 41
   cfg["bee_sets"] = Json::arrayValue;
   cfg["bee_sets"].append("truth");
   cfg["bee_sets"].append("sed");
@@ -235,6 +237,8 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
   m_reality = get(cfg, "reality", m_reality);
   // Two-instance knobs (see the header).  Absent keys => historical behavior.
   m_label_blobs = get(cfg, "label_blobs", m_label_blobs);
+  m_truth_detail = get(cfg, "truth_detail", m_truth_detail);
+  m_truth_track_datapath = get(cfg, "truth_track_datapath", m_truth_track_datapath);
   m_pf_metadata_key = get<std::string>(cfg, "pf_metadata_key", m_pf_metadata_key);
   if (cfg["bee_sets"].isArray()) {
     m_bee_truth = m_bee_sed = m_bee_tagger = m_bee_pf = false;
@@ -500,6 +504,7 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
   m_michel_mother.clear();
   m_nu_edep.clear();
   m_nu_trackids.clear();
+  m_mcp.clear();
 
   // --- neutrino truth (cf. Truth2h5) ---
   // An event can carry SEVERAL beam-neutrino interactions (rockbox: the
@@ -611,6 +616,26 @@ void AIML::TensorSetLabeler::visit(art::Event& event)
       else {
         log->warn("no MCParticle<->MCTruth Assns at '{}': no beam-nu tagging",
                   m_mcparticle_label);
+      }
+    }
+    // issue 41 (truth_detail): every MCParticle by trackid, for the truth_track table.
+    if (m_truth_detail) {
+      m_mcp.reserve(mcps->size());
+      for (size_t i = 0; i < mcps->size(); ++i) {
+        const auto& p = (*mcps)[i];
+        const auto itmom = tid2pdg.find(p.Mother());
+        McpInfo mi;
+        mi.pdg = p.PdgCode();
+        mi.mother = p.Mother();
+        mi.mother_pdg = (itmom == tid2pdg.end() ? 0 : itmom->second);
+        mi.process = g4_process_code(p.PdgCode(), p.Process(), mi.mother_pdg);
+        mi.nu_index = (i < nu_index.size() ? nu_index[i] : -1);
+        const auto& s4 = p.Position(0);
+        const auto& e4 = p.EndPosition();
+        mi.sx = s4.X(); mi.sy = s4.Y(); mi.sz = s4.Z(); mi.st = s4.T();
+        mi.sE = p.Momentum(0).E();
+        mi.ex = e4.X(); mi.ey = e4.Y(); mi.ez = e4.Z();
+        m_mcp[p.TrackId()] = mi;
       }
     }
     m_tracks.reserve(m_truth_tracks_nu_only ? 64 : mcps->size());
@@ -950,6 +975,7 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   struct PDepo {
     int wip[3];
     int trackid;
+    size_t di;       // index into m_depos (issue 41: which depos some blob accepted)
     double weight;
     double stick;    // diffusion+SP sigma along drift, in ticks
     double swire[3]; // diffusion+SP sigma along pitch, in wires, per plane
@@ -1021,7 +1047,19 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
   // Both ternary arms are lvalues of the same type, so this binds a reference
   // and does NOT copy m_depos.
   static const std::vector<Depo> s_no_depos;
-  for (const auto& d : (m_label_blobs ? m_depos : s_no_depos)) {
+  const auto& depos_used = (m_label_blobs ? m_depos : s_no_depos);
+  // issue 41 (truth_detail): per G4 track, the charge (labeling weight) and
+  // energy inside the readout window after the pseudo-sim, and which depos
+  // some blob accepted.
+  struct TrackAcc {
+    double q_readout{0}, e_readout{0}, q_in_blobs{0}, q_dom_blobs{0};
+    int n_blobs_dom{0};
+  };
+  std::map<int, TrackAcc> tacc;
+  const bool detail = is_sim && m_label_blobs && m_truth_detail;
+  std::vector<char> depo_accepted(detail ? depos_used.size() : 0, 0);
+  for (size_t di = 0; di < depos_used.size(); ++di) {
+    const auto& d = depos_used[di];
     const double tdep = d.t + m_depo_time_offset;
     for (const auto& [af, fc] : m_faces) {
       // apparent (drifted) x: later deposit -> deeper into the volume
@@ -1032,6 +1070,16 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       PDepo pd;
       pd.trackid = d.trackid;
       pd.weight = d.weight;
+      pd.di = di;
+      if (detail) {
+        // the readout cut of the sed sets: pseudo-sim time of the apparent x
+        const double pseudo_t = (x_app - fc.xw) * fc.dirx / m_drift_speed;
+        if (pseudo_t >= m_readout_tmin && pseudo_t <= m_readout_tmax) {
+          auto& ta = tacc[d.trackid];
+          ta.q_readout += d.weight;
+          ta.e_readout += d.e;
+        }
+      }
       // Diffusion ball: drift diffusion sigma = sqrt(2*D*t_drift) from the
       // ACTUAL drift distance, plus the SP filter smearing, in quadrature.
       {
@@ -1158,6 +1206,8 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
       }
 
       int tid = -1;
+      int tid2 = -1;                                      // issue 41
+      double blob_q = 0, blob_qdom = 0, blob_q2 = 0;      // issue 41
       auto pit = proj.find({wpid.apa(), wpid.face()});
       if (pit != proj.end()) {
         std::unordered_map<int, double> acc;
@@ -1180,7 +1230,10 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
                 break;
               }
             }
-            if (inside) { acc[pd.trackid] += pd.weight; }
+            if (inside) {
+              acc[pd.trackid] += pd.weight;
+              if (detail) { depo_accepted[pd.di] = 1; }
+            }
           }
         }
         double best = 0;
@@ -1189,6 +1242,13 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
             best = w;
             tid = t;
           }
+        }
+        if (detail) {
+          for (const auto& [t, w] : acc) {
+            blob_q += w;
+            if (t != tid && w > blob_q2) { blob_q2 = w; tid2 = t; }
+          }
+          blob_qdom = best;
         }
       }
 
@@ -1212,6 +1272,27 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
         if (a->size_major() > 0) { tid = a->elements<int>()[0]; }
       }
       if (tid >= 0) { ++nlabeled; }
+      // issue 41: the blob's truth detail, next to trackid (every live blob
+      // gets every key: the point-tree serializer needs one schema per PC).
+      if (detail) {
+        auto put_i = [&](const char* k, int v) {
+          if (scalar.has(k)) { scalar.get(k)->assign(&v, PointCloud::Array::shape_t{1}, false); }
+          else { scalar.add(k, Array({v})); }
+        };
+        auto put_d = [&](const char* k, double v) {
+          if (scalar.has(k)) { scalar.get(k)->assign(&v, PointCloud::Array::shape_t{1}, false); }
+          else { scalar.add(k, Array({v})); }
+        };
+        put_d("truth_q", blob_q);
+        put_d("truth_q_dom", blob_qdom);
+        put_i("trackid2", tid2);
+        put_d("truth_q2", blob_q2);
+        if (tid >= 0) {
+          auto& ta = tacc[tid];
+          ++ta.n_blobs_dom;
+          ta.q_dom_blobs += blob_qdom;
+        }
+      }
 
       // debug Bee dump (sim only -- truth-derived): 3d points in raw coords,
       // cluster_id = trackid.
@@ -1697,6 +1778,67 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     }
     outtens.push_back(
       std::make_shared<SimpleTensor>(std::vector<size_t>{nrows, ncols}, flat.data(), md));
+  }
+
+  // issue 41: truth_track tensor, one row per G4 track that deposited inside
+  // the readout window or dominates a blob.  [ntracks x ncols] doubles.
+  if (detail) {
+    for (size_t di = 0; di < depos_used.size(); ++di) {
+      if (depo_accepted[di]) { tacc[depos_used[di].trackid].q_in_blobs += depos_used[di].weight; }
+    }
+    static const std::vector<std::string> tt_columns = {
+      "trackid", "nu_idx", "bee_trackid", "ancestor_trackid", "prong_trackid", "pdg", "mother_trackid",
+      "mother_pdg", "process", "q_readout", "e_readout", "q_in_blobs", "n_blobs_dom",
+      "q_dom_blobs", "start_x", "start_y", "start_z", "start_t", "start_E",
+      "end_x", "end_y", "end_z"};
+    const size_t ncols = tt_columns.size();
+    std::vector<double> flat;
+    flat.reserve(tacc.size() * ncols);
+    for (const auto& [t, ta] : tacc) {
+      const auto mit = m_mcp.find(t);
+      const McpInfo mi = (mit == m_mcp.end() ? McpInfo{} : mit->second);
+      // ancestor: follow Mother() while the mother is a stored MCParticle
+      int anc = t;
+      for (int guard = 0; guard < 10000; ++guard) {
+        const auto it = m_mcp.find(anc);
+        if (it == m_mcp.end() || it->second.mother == 0 || !m_mcp.count(it->second.mother)) { break; }
+        anc = it->second.mother;
+      }
+      const auto itm = m_michel_mother.find(t);
+      const int bee_t = (itm == m_michel_mother.end() ? t : itm->second);
+      // prong: the particle a reco particle is compared with.  An EM daughter
+      // of an EM particle folds into it (a shower is one prong), as does an
+      // ionization (delta) electron or a muon's radiative e/gamma into its
+      // mother; a Michel electron stays its own prong.
+      int prong = t;
+      for (int guard = 0; guard < 10000; ++guard) {
+        const auto it = m_mcp.find(prong);
+        if (it == m_mcp.end()) { break; }
+        const auto im = m_mcp.find(it->second.mother);
+        if (it->second.mother == 0 || im == m_mcp.end()) { break; }
+        const int ap = std::abs(it->second.pdg), am = std::abs(im->second.pdg);
+        const bool em = (ap == 11 || ap == 22), mem = (am == 11 || am == 22);
+        const int proc = it->second.process;
+        const bool delta = (ap == 11 && (proc == 2 || proc == 3 || proc == 8 || proc == 30));
+        const bool radiative = (em && am == 13 && (proc == 10 || proc == 12));
+        if ((em && mem) || delta || radiative) { prong = it->second.mother; }
+        else { break; }
+      }
+      const std::vector<double> row = {
+        (double)t, (double)mi.nu_index, (double)bee_t, (double)anc, (double)prong, (double)mi.pdg,
+        (double)mi.mother, (double)mi.mother_pdg, (double)mi.process,
+        ta.q_readout, ta.e_readout, ta.q_in_blobs, (double)ta.n_blobs_dom, ta.q_dom_blobs,
+        mi.sx, mi.sy, mi.sz, mi.st, mi.sE, mi.ex, mi.ey, mi.ez};
+      flat.insert(flat.end(), row.begin(), row.end());
+    }
+    Json::Value md = Json::objectValue;
+    md["datapath"] = format_path(m_truth_track_datapath, ident);
+    md["datatype"] = "truth_track";
+    md["units"] = "charge: electrons (labeling weight), e_readout MeV, cm, ns, GeV";
+    for (const auto& col : tt_columns) { md["columns"].append(col); }
+    outtens.push_back(std::make_shared<SimpleTensor>(
+      std::vector<size_t>{tacc.size(), ncols}, flat.data(), md));
+    log->debug("call={} ident={}: truth_track {} tracks", m_count, ident, tacc.size());
   }
 
   // Event-level metadata.
