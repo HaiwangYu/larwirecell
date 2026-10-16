@@ -68,6 +68,7 @@
 #include "WireCellIface/ITensorSetFilter.h"
 #include "larwirecell/Interfaces/IArtEventVisitor.h"
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -82,8 +83,15 @@ namespace wcls {
 
     /// IArtEventVisitor -- called at event start, before the graph runs.
     virtual void visit(art::Event& event);
-    // ai-helper issue 39: remember the art input file, stamped as metadata "input_file"
-    virtual void respond_to_open_input_file(const std::string& filename) { m_input_file = filename; }
+    // ai-helper issue 39: remember the art input file, stamped as metadata "input_file".
+    // sbnd-wirecell-production #1: a non-empty environment variable WCLS_INPUT_FILE wins, so a
+    // job reading a local copy (a grid scratch copy, the FrameShift copy of data) records the
+    // original file instead of the copy.
+    virtual void respond_to_open_input_file(const std::string& filename)
+    {
+        const char* ov = std::getenv("WCLS_INPUT_FILE");
+        m_input_file = (ov && *ov) ? std::string(ov) : filename;
+    }
 
     /// ITensorSetFilter
     virtual bool operator()(const input_pointer& in, output_pointer& out);
