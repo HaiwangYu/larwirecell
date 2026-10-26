@@ -364,6 +364,14 @@ namespace WireCell::AIML {
     //                     "cluster": the cluster ident (== sp/features[:,1]).
     std::string m_bundle_id_source{"cluster"};
     std::string m_segment_id_source{"real_cluster"};
+    // Light-H5 V2: serialize the QLMatching "opflash" point cloud (the flashes
+    // QLMatching admitted and matched against) and each bundle's
+    // matched_flash_gid.  A readout of the grouping only -- no art product, no
+    // re-matching.  An event without an "opflash" PC writes n_flash = 0.
+    // Default off: enable it explicitly on the nugraph.h5 writer instance
+    // (labeler_truth in the SBND production cfg).
+    bool m_light_h5{false};
+    int m_light_nchan{312};
     // detector geometry for the "ctpc" blob-blob graph flavor (sp_nexus_sp)
     IDetectorVolumes::pointer m_dv{nullptr};
     WireCell::Clus::IPCTransformSet::pointer m_pcts{nullptr};

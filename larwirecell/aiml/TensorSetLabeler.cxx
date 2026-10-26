@@ -29,10 +29,14 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
+#include <map>
+#include <set>
 #include <unordered_map>
 
 WIRECELL_FACTORY(wclsTensorSetLabeler,
@@ -212,6 +216,8 @@ Configuration AIML::TensorSetLabeler::default_configuration() const
   cfg["plane_knn"] = m_plane_knn;
   cfg["bundle_id_source"] = m_bundle_id_source;
   cfg["segment_id_source"] = m_segment_id_source;
+  cfg["light_h5"] = m_light_h5;
+  cfg["light_nchan"] = m_light_nchan;
   // IDetectorVolumes + IPCTransformSet for the "ctpc" blob-blob graph flavor.
   cfg["detector_volumes"] = "";
   cfg["pc_transforms"] = "";
@@ -291,6 +297,11 @@ void AIML::TensorSetLabeler::configure(const Configuration& cfg)
   m_segment_id_source = get(cfg, "segment_id_source", m_segment_id_source);
   if (m_segment_id_source != "real_cluster" && m_segment_id_source != "cluster") {
     THROW(ValueError() << errmsg{"wclsTensorSetLabeler: segment_id_source must be \"real_cluster\" or \"cluster\""});
+  }
+  m_light_h5 = get(cfg, "light_h5", m_light_h5);
+  m_light_nchan = get(cfg, "light_nchan", m_light_nchan);
+  if (m_light_nchan <= 0) {
+    THROW(ValueError() << errmsg{"wclsTensorSetLabeler: light_nchan must be positive"});
   }
   {
     const std::string dv_tn = get<std::string>(cfg, "detector_volumes", "");
@@ -1322,8 +1333,12 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
     std::unordered_map<const Fac::Blob*, int> blob2idx;
     std::vector<Fac::Cluster*> clusters;
     int gidx = 0;
+    // Light-H5 V2: (reco_bundle_id, matched_flash_gid) of every cluster that
+    // contributed >= 1 SP, so bundle/id joins exactly to sp/reco_bundle_id.
+    std::vector<std::pair<long long, long long>> light_bundle_pairs;
     for (auto* cluster : grouping->children()) {
       clusters.push_back(cluster);
+      const int light_gidx_start = gidx;
       long long reco_clid = -1;
       {
         auto& cpc = cluster->value().local_pcs();
@@ -1409,6 +1424,16 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
         sp_apa_vec.push_back(bi.apa);
         sp_face_vec.push_back(bi.face);
         blob2idx[blob] = gidx++;
+      }
+      if (m_light_h5 && gidx > light_gidx_start && reco_bundle_id >= 0) {
+        long long mgid = -1;  // QLMatching stamps -1 on unmatched clusters
+        auto& cpc = cluster->value().local_pcs();
+        auto it = cpc.find("cluster_scalar");
+        if (it != cpc.end()) {
+          auto a = it->second.get("matched_flash_gid");
+          if (a && a->size_major() > 0) { mgid = (long long)a->elements<int>()[0]; }
+        }
+        light_bundle_pairs.emplace_back(reco_bundle_id, mgid);
       }
     }
     const int Nsp = gidx;
@@ -1740,6 +1765,127 @@ bool AIML::TensorSetLabeler::operator()(const input_pointer& in, output_pointer&
           addI(p + "/face", {0}, {1});
         }
         add_edges(p + "_nexus_sp/edge_index", nx_src[pl], nx_dst[pl]);
+      }
+
+      // ===== LIGHT_H5_V2 (appended after every other member) =====
+      // The flash table QLMatching itself matched against, read straight from the
+      // grouping: the "opflash" PC (QLMatching::write_opflash_pc -- one row per
+      // (admitted flash, channel): gid, time, ch, pe, apa; carried through the
+      // all-APA merge and MABC) and each bundle's cluster_scalar matched_flash_gid,
+      // which QLMatching stamps with the SAME gid rule.  No art product and no
+      // re-matching.  flash/time is the time QLMatching used (frame shift applied
+      // upstream when FlashTensorToOpticalPCs.correct_flash_time).  Tables are
+      // padded to >= 1 row because zero-length compound members cannot be written.
+      if (m_light_h5) {
+        const int nch = m_light_nchan;
+        struct QFlash { long long apa; double time; std::vector<double> pe; std::vector<int> nseen; };
+        std::map<long long, QFlash> qlm;  // ordered by gid
+        {
+          auto& gpcs = root->value.local_pcs();
+          auto oit = gpcs.find("opflash");
+          if (oit != gpcs.end()) {
+            auto agid = oit->second.get("gid");
+            auto atim = oit->second.get("time");
+            auto ach = oit->second.get("ch");
+            auto ape = oit->second.get("pe");
+            auto aapa = oit->second.get("apa");
+            if (!(agid && atim && ach && ape && aapa)) {
+              THROW(ValueError() << errmsg{"nugraph light_h5: incomplete 'opflash' PC"});
+            }
+            const auto vg = agid->elements<int>();
+            const auto vt = atim->elements<double>();
+            const auto vc = ach->elements<int>();
+            const auto vp = ape->elements<double>();
+            const auto va = aapa->elements<int>();
+            const size_t nr = vg.size();
+            if (vt.size() != nr || vc.size() != nr || vp.size() != nr || va.size() != nr) {
+              THROW(ValueError() << errmsg{"nugraph light_h5: 'opflash' PC arrays differ in length"});
+            }
+            for (size_t r = 0; r < nr; ++r) {
+              auto qit = qlm.find(vg[r]);
+              if (qit == qlm.end()) {
+                QFlash q{(long long)va[r], vt[r], std::vector<double>(nch, 0.0), std::vector<int>(nch, 0)};
+                qit = qlm.emplace((long long)vg[r], std::move(q)).first;
+              }
+              auto& q = qit->second;
+              if (q.apa != (long long)va[r] || q.time != vt[r]) {
+                THROW(ValueError() << errmsg{"nugraph light_h5: 'opflash' gid with non-constant apa/time"});
+              }
+              if (vc[r] < 0 || vc[r] >= nch) {
+                THROW(ValueError() << errmsg{"nugraph light_h5: 'opflash' channel out of range (light_nchan)"});
+              }
+              q.pe[vc[r]] = vp[r];
+              q.nseen[vc[r]] += 1;
+            }
+            for (const auto& kv : qlm) {
+              for (int c = 0; c < nch; ++c) {
+                if (kv.second.nseen[c] != 1) {
+                  THROW(ValueError() << errmsg{"nugraph light_h5: 'opflash' gid does not cover each channel exactly once"});
+                }
+              }
+            }
+          }
+        }
+
+        const int F = (int)qlm.size();
+        const int NF = std::max(F, 1);
+        const float fnan = std::numeric_limits<float>::quiet_NaN();
+        std::vector<long long> f_valid(NF, 0), f_gid(NF, -1), f_tpc(NF, -1);
+        std::vector<float> f_time(NF, fnan), f_pe((size_t)NF * nch, 0.f);
+        {
+          int k = 0;
+          for (const auto& kv : qlm) {
+            f_valid[k] = 1;
+            f_gid[k] = kv.first;
+            f_tpc[k] = kv.second.apa;
+            f_time[k] = (float)(kv.second.time / units::microsecond);
+            for (int c = 0; c < nch; ++c) { f_pe[(size_t)k * nch + c] = (float)kv.second.pe[c]; }
+            ++k;
+          }
+        }
+
+        // bundle table, sorted by bundle id
+        std::map<long long, std::set<long long>> bmap;
+        for (const auto& bp : light_bundle_pairs) { bmap[bp.first].insert(bp.second); }
+        const int B = (int)bmap.size();
+        const int NB = std::max(B, 1);
+        std::vector<long long> b_valid(NB, 0), b_id(NB, -1), b_gid(NB, -1);
+        int n_incons = 0, n_unresolved = 0, n_matched = 0, kb = 0;
+        for (const auto& kv : bmap) {
+          long long g = -1;
+          if (kv.second.size() == 1) { g = *kv.second.begin(); }
+          else {
+            g = -2;  // only possible with bundle_id_source "stamp"
+            ++n_incons;
+            log->error("nugraph light_h5: rse=({},{},{}) bundle {} carries {} different matched_flash_gid values",
+                       m_run, m_sub, m_evt, kv.first, kv.second.size());
+          }
+          if (g >= 0) {
+            if (qlm.count(g)) { ++n_matched; }
+            else {
+              ++n_unresolved;
+              log->error("nugraph light_h5: rse=({},{},{}) bundle {} matched_flash_gid {} not in the opflash PC",
+                         m_run, m_sub, m_evt, kv.first, g);
+            }
+          }
+          b_valid[kb] = 1;
+          b_id[kb] = kv.first;
+          b_gid[kb] = g;
+          ++kb;
+        }
+
+        addI("metadata/light_schema_version", {2}, {});
+        addI("metadata/n_flash", {(long long)F}, {});
+        addI("flash/valid", std::move(f_valid), {(unsigned long long)NF});
+        addI("flash/gid", std::move(f_gid), {(unsigned long long)NF});
+        addI("flash/tpc", std::move(f_tpc), {(unsigned long long)NF});
+        addF("flash/time", std::move(f_time), {(unsigned long long)NF});
+        addF("flash/pe", std::move(f_pe), {(unsigned long long)NF, (unsigned long long)nch});
+        addI("bundle/valid", std::move(b_valid), {(unsigned long long)NB});
+        addI("bundle/id", std::move(b_id), {(unsigned long long)NB});
+        addI("bundle/flash_gid", std::move(b_gid), {(unsigned long long)NB});
+        log->info("nugraph light_h5 v2: rse=({},{},{}) n_flash={} bundles={} matched={} inconsistent={} unresolved={}",
+                  m_run, m_sub, m_evt, F, B, n_matched, n_incons, n_unresolved);
       }
 
       m_events.push_back(std::move(ev));
