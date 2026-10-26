@@ -350,6 +350,28 @@ namespace WireCell::AIML {
     bool m_hdf5_output{true};      // write the nugraph .h5 (default on)
     std::string m_hdf5_filename{"nugraph.h5"};
     int m_plane_knn{6};            // sp-sp kNN fallback (see .cxx)
+    // Reconstruction provenance of each SP (see "RECO PROVENANCE" in the .cxx).
+    //   bundle_id_source  "cluster": sp/reco_bundle_id = the cluster ident -- the
+    //                       Q/L flash bundle wherever the labeler runs before the PR
+    //                       stage's unmerge_bundle (e.g. labeler_truth after
+    //                       clus_all_apa, the production nugraph.h5 writer);
+    //                     "stamp": the perblob "matching_bundle_id" column (-1 if
+    //                       absent), for a labeler placed after the PR split.
+    //   segment_id_source "real_cluster": sp/reco_segment_id = the blob's perblob
+    //                       "real_cluster_id" (the pre-collapse member that
+    //                       ClusteringUnmergeBundle splits on), falling back to the
+    //                       cluster ident when the array is absent;
+    //                     "cluster": the cluster ident (== sp/features[:,1]).
+    std::string m_bundle_id_source{"cluster"};
+    std::string m_segment_id_source{"real_cluster"};
+    // Light-H5 V2: serialize the QLMatching "opflash" point cloud (the flashes
+    // QLMatching admitted and matched against) and each bundle's
+    // matched_flash_gid.  A readout of the grouping only -- no art product, no
+    // re-matching.  An event without an "opflash" PC writes n_flash = 0.
+    // Default off: enable it explicitly on the nugraph.h5 writer instance
+    // (labeler_truth in the SBND production cfg).
+    bool m_light_h5{false};
+    int m_light_nchan{312};
     // detector geometry for the "ctpc" blob-blob graph flavor (sp_nexus_sp)
     IDetectorVolumes::pointer m_dv{nullptr};
     WireCell::Clus::IPCTransformSet::pointer m_pcts{nullptr};
